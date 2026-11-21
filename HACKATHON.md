@@ -16,6 +16,11 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
 - **Ties**: within 1 s of the best counts as a tie, earliest submission wins. Repo must stay public with every
   submitted commit until results.
 
+## Score log (every submission)
+After each submission is scored: `python3 ~/brain/hackscore.py log blast-radius <commit> <score> --receipt BB-.. --note "<sim + CPU, misses>"`.
+Before submitting a candidate: `python3 ~/brain/hackscore.py practice blast-radius <commit>` (arm64 image, sample + 134 fakes,
+predicts the board score from past board/practice pairs). `python3 ~/brain/hackscore.py show blast-radius` = the full history.
+
 ## The score math (what each lever is worth)
 - One miss = +300 s. Our whole practice score is 197 s, so **one miss in the final loses**. Dropping a test is only
   worth it if its chance of hiding a failure is under (seconds saved ÷ 300): saving 2 s needs < 0.7 % risk.
