@@ -121,10 +121,10 @@ def fingerprint(i, sqls, gen):
         parts.append(plan_dump(Plan(opt)))
         parts.append(transpile(sql, write="duckdb")[0])
         ex = py.PythonExecutor(tables={})
-        outs = []
+        outs, ctes, exprs = [], {}, {}
         for raw_expr, raw_ctes in gen.get(i, ()):
-            ex._ctes = pickle.loads(raw_ctes)
-            x = pickle.loads(raw_expr)
+            ex._ctes = ctes.get(raw_ctes) or ctes.setdefault(raw_ctes, pickle.loads(raw_ctes))  # one object per query, like plan.ctes
+            x = exprs.get(raw_expr) or exprs.setdefault(raw_expr, pickle.loads(raw_expr))  # generate never mutates its input
             if not x:
                 outs.append(None)
                 continue

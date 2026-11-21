@@ -1096,7 +1096,7 @@ class TpcdsPrint:
             return None
         if not qs:
             return None
-        return sorted(qs), 150 + 25 * len(qs)
+        return sorted(qs), 300 + 220 * len(qs)  # measured: ~0.13 s optimize + ~0.08 s replay and dumps per query
 
 
 class TpcdsMap:
