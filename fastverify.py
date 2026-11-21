@@ -126,7 +126,15 @@ class _Timeout(BaseException):
     pass
 
 
+_FIRED = [0]
+
+
 def _alarm(signum, frame):
+    # first time: interrupt the test; again (a subTest swallowed it and kept looping): end the child,
+    # the parent then counts this unreported test as failing
+    _FIRED[0] += 1
+    if _FIRED[0] > 1:
+        os._exit(0)
     raise _Timeout()
 
 
@@ -416,7 +424,8 @@ class _Rec(unittest.TestResult):
     def startTest(self, test):
         super().startTest(test)
         self.cur, self.bad = self._tid(test), False
-        signal.setitimer(signal.ITIMER_REAL, self.limits.get(self.cur, 10.0))
+        _FIRED[0] = 0
+        signal.setitimer(signal.ITIMER_REAL, self.limits.get(self.cur, 10.0), 0.5)
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)

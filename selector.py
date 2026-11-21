@@ -190,6 +190,8 @@ def parse_patch(text: str):
                 "nleft": nlen,
             }
             cur["hunks"].append(hunk)
+        elif cur is not None and cur["hunks"] and line[:1] in ("+", "-") and not line.startswith(("+++ ", "--- ")):
+            cur["stray"] = True  # a change line outside every hunk: the counts are wrong
         elif cur is not None:
             if line.startswith("Binary files") or line.startswith("GIT binary patch"):
                 cur["binary"] = True
@@ -331,7 +333,7 @@ def diff_lists(old, new, ctx, parent, out):
                 if isinstance(od[i1 + k], tuple) and od[i1 + k][0] == "block":
                     diff_node(old[i1 + k], new[j1 + k], ctx, out)
             continue
-        if tag == "replace" and i2 - i1 == j2 - j1:
+        if tag == "replace" and i2 - i1 == j2 - j1 and all(type(o) is type(n) for o, n in zip(old[i1:i2], new[j1:j2])):
             for o, n in zip(old[i1:i2], new[j1:j2]):
                 diff_node(o, n, ctx, out)
             continue
@@ -387,7 +389,7 @@ def singleton_like(node):
     if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1:
         base = node.value
         name = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else ""
-        return name[:1].isupper() and not name.isupper() and name not in MIXIN_ENUMS
+        return name in PURE_ENUMS
     return False
 
 
@@ -395,6 +397,10 @@ def singleton_like(node):
 # In the pinned code only Dialects is compared against plain strings; TokenType, NormalizationStrategy,
 # UsingColumnOrder and AliasPrecedence values always come from enum members (Dialect.__init__ converts settings).
 MIXIN_ENUMS = {"Dialects"}
+# `x is C.M` == `x == C.M` only when C is an enum: a class constant like Drill.DATE_FORMAT is a plain string.
+# Every enum class in the pinned sqlglot (and DataType.Type, an alias of DType), minus the str one above.
+PURE_ENUMS = {"TokenType", "DType", "Type", "ErrorLevel", "PropertiesLocation", "ScopeType", "IsPredicatePrecedence",
+              "TrieResult", "NormalizationStrategy", "UsingColumnOrder", "AliasPrecedence"} - MIXIN_ENUMS
 
 
 def same_compare(o, n):
@@ -467,6 +473,34 @@ def node_span(node, part):
         if body:
             last = max(first, body[0].lineno - 1)
     return first, last
+
+
+HARMLESS_DECORATORS = {"property", "staticmethod", "classmethod", "cached_property", "abstractmethod", "overload"}
+
+
+def simple_value(node):
+    """A constant, a name or a dotted name: evaluating it at import cannot fail in a new way."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, (ast.Constant, ast.Name)) or (
+        isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
+    )
+
+
+def import_time_risk(old, new):
+    """Decorators and default values run when the module is imported: a new one there can break every importer."""
+    olds = {dump(d) for d in old.decorator_list}
+    for d in new.decorator_list:
+        if dump(d) in olds:
+            continue
+        name = d.attr if isinstance(d, ast.Attribute) else d.id if isinstance(d, ast.Name) else None
+        if name not in HARMLESS_DECORATORS:
+            return True
+    od = {dump(x) for x in old.args.defaults + [k for k in old.args.kw_defaults if k is not None]}
+    for x in new.args.defaults + [k for k in new.args.kw_defaults if k is not None]:
+        if dump(x) not in od and not simple_value(x):
+            return True
+    return False
 
 
 def target_names(node):
@@ -611,6 +645,8 @@ class Selector:
             return self.gone(old_path) | self.listers(old_path), "deleted"
         if f.get("binary"):
             return self.gone(old_path), "binary"
+        if f.get("stray"):
+            return self.m.file_tests(old_path) | self.m.open_tests(old_path) or set(self.all), "malformed hunk counts"
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             return self.python(old_path, f["hunks"])
         if old_path.startswith(("tests/", "sqlglot/")):
@@ -717,6 +753,9 @@ class Selector:
                 # a new class registers itself at import (metaclass, __init_subclass__, subclass scans such
                 # as the parser's function table) and a decorator runs at import: nobody needs to read its name
                 return m.file_tests(path) | self.listers(path), "new class or decorated def"
+            if any(n.startswith("__") and n.endswith("__") for n in target_names(node)):
+                # __all__, __slots__, __bool__, __eq__ ...: used implicitly by Python, never read by name
+                return m.file_tests(path), "new dunder name"
             if c.ctx and c.ctx[-1][0] == "class" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 # a new method is found through dir()/getattr (e.g. the generator's *_sql dispatch), not by name
                 return self.class_tests(path, c.ctx), "new method"
@@ -729,7 +768,11 @@ class Selector:
                 for nb in (prev, nxt):
                     if nb is not None:
                         got |= m.line_tests(path, *node_span(nb, "all"))
-                if not isinstance(node, ast.Module):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # the def line runs at import for everyone; whoever calls the function runs a body line
+                    body = m.line_tests(path, node.body[0].lineno, node.end_lineno)
+                    got |= body or m.line_tests(path, *node_span(node, "header"))
+                elif not isinstance(node, ast.Module):
                     got |= m.line_tests(path, *node_span(node, "header"))
                 return got, "insert in function"
             return set(), "insert at top"
@@ -744,6 +787,8 @@ class Selector:
                 return body | (m.name_tests(node.name) or set()) | self.scope_tests(
                     path, c.ctx, None
                 ), "def changed"
+            if c.new is not None and import_time_risk(node, c.new):
+                return body | m.file_tests(path), "def header runs at import"
             return body, "def header"
         if isinstance(node, ast.ClassDef):
             inner = self.class_tests(path, c.ctx + (("class", node.name),))
