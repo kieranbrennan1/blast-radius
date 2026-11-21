@@ -17,6 +17,8 @@ for src in srcs:
     if not os.path.exists(p):
         continue
     for cid, v in json.load(open(p))["commits"].items():
+        if v.get("timeout"):  # truth run hit its wall-clock cap: label unknown, leave it out
+            continue
         answers[cid] = v
         shutil.copy(os.path.join(src, "commits", f"{cid}.patch"), os.path.join(out, "commits"))
 json.dump({"commits": answers}, open(os.path.join(out, "answers.json"), "w"), indent=1)

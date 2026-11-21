@@ -443,7 +443,10 @@ def truth(repo, py, out, tests_json):
             PATH=os.path.dirname(py) + ":" + os.environ["PATH"],
             PYTHONDONTWRITEBYTECODE="1",
         )
-        subprocess.run(
+        # Wall-clock cap per commit (round 2, 2026-11-21): m41022 made while_changing loop forever, so every
+        # optimizer test sat at the 900 s timeout and one commit ran 2+ hours. A commit that hits the cap is
+        # recorded with "timeout": true and left out of scoring by tools/answered.py.
+        proc = subprocess.Popen(
             [
                 py,
                 "-m",
@@ -463,8 +466,17 @@ def truth(repo, py, out, tests_json):
             ],
             cwd=root,
             env=env,
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
+        timed_out = False
+        try:
+            proc.wait(timeout=int(os.environ.get("TRUTH_CAP", "2400")))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            os.killpg(proc.pid, 9)
+            proc.wait()
         failed = set()
         for nid in (
             json.load(open(res)) if os.path.exists(res) else ["collect:everything"]
@@ -485,6 +497,8 @@ def truth(repo, py, out, tests_json):
         for p, text in saved.items():
             open(os.path.join(root, p), "w").write(text)
         answers[cid] = {"failing": sorted(failed), "kind": kinds.get(cid, "?")}
+        if timed_out:
+            answers[cid]["timeout"] = True
         json.dump({"commits": answers}, open(answers_path, "w"), indent=1)
         print(cid, kinds.get(cid), len(failed), flush=True)
     shutil.rmtree(work)
