@@ -489,6 +489,11 @@ def defined_names(body):
     return out
 
 
+def bare_string(node):
+    """A statement that is only a string (a docstring): no test reads __doc__, so it changes nothing."""
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
 def exp_class(node):
     """'IntDiv' for `exp.IntDiv`, else None."""
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp" and node.attr[:1].isupper():
@@ -636,6 +641,8 @@ class Selector:
 
     def change_tests(self, path, c):
         m = self.m
+        if bare_string(c.node) and (c.new is None or bare_string(c.new)) and c.part in ("all", "new"):
+            return set(), "docstring"
         in_func = any(kind == "func" for kind, _ in c.ctx)
         node = c.node
         if c.part == "new":
