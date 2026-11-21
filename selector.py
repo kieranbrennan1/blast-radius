@@ -56,6 +56,8 @@ class Map:
         self.opens = d["opens"]
         self.touched = d["touched"]
         self.names = d.get("names", {})
+        self.rlines = d.get("rlines")
+        self.import_lines = d.get("import_lines", {})
         self._decoded: dict = {}
 
     def s(self, i) -> frozenset:
@@ -68,12 +70,18 @@ class Map:
             got = self._decoded[i] = frozenset(out)
         return got
 
-    def line_tests(self, file: str, first: int, last: int) -> set:
+    def line_tests(self, file: str, first: int, last: int, runtime=False) -> set:
+        """Tests that executed any of these lines; runtime=True counts only function code."""
         fm = self.lines.get(file)
+        rm = (self.rlines or {}).get(file, {}) if runtime else {}
         out: set = set()
         if fm:
             for ln in range(first, last + 1):
-                i = fm.get(ln, fm.get(str(ln)))
+                i = rm.get(ln, rm.get(str(ln))) if runtime else None
+                if i is None:
+                    i = fm.get(ln, fm.get(str(ln)))
+                    if runtime and i is not None and (ln in self.import_lines.get(file, ()) or str(ln) in self.import_lines.get(file, ())):
+                        continue  # executed only by a module or class body
                 if i is not None:
                     out |= self.s(i)
         return out
@@ -193,10 +201,10 @@ def dump(node):
 
 
 class Change:
-    __slots__ = ("node", "ctx", "part", "neighbors")
+    __slots__ = ("node", "ctx", "part", "neighbors", "new")
 
-    def __init__(self, node, ctx, part, neighbors=None):
-        self.node, self.ctx, self.part, self.neighbors = node, ctx, part, neighbors
+    def __init__(self, node, ctx, part, neighbors=None, new=None):
+        self.node, self.ctx, self.part, self.neighbors, self.new = node, ctx, part, neighbors, new
 
 
 def header_dump(node):
@@ -243,7 +251,7 @@ def diff_node(o, n, ctx, out):
         out.append(Change(o, ctx, "all"))
         return
     if not any(isinstance(getattr(o, f, None), list) for f in COMPOUND_BODIES):
-        out.append(Change(o, ctx, "all"))
+        out.append(Change(o, ctx, "all", new=n))
         return
     if header_dump(o) != header_dump(n):
         out.append(Change(o, ctx, "header"))
@@ -268,6 +276,29 @@ def diff_node(o, n, ctx, out):
                     diff_lists(a.body, b.body, inner, a, out)
         else:
             diff_lists(ol, nl, inner, o, out)
+
+
+def diff_spots(o, n):
+    """Smallest old nodes that differ; a lambda counts as one unit."""
+    if dump(o) == dump(n):
+        return []
+    if type(o) is not type(n) or isinstance(o, ast.Lambda):
+        return [o]
+    spots = []
+    for (name, a), (_, b) in zip(ast.iter_fields(o), ast.iter_fields(n)):
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                return [o]
+            for x, y in zip(a, b):
+                if isinstance(x, ast.AST) and isinstance(y, ast.AST):
+                    spots += diff_spots(x, y)
+                elif x != y:
+                    return [o]
+        elif isinstance(a, ast.AST) and isinstance(b, ast.AST):
+            spots += diff_spots(a, b)
+        elif a != b:
+            return [o]
+    return spots
 
 
 def node_span(node, part):
@@ -451,6 +482,13 @@ class Selector:
             return inner | self.scope_tests(
                 path, c.ctx, {node.name}
             ), "class header" if c.part == "header" else "class changed"
+        if c.new is not None and m.rlines is not None:
+            spots = diff_spots(node, c.new)
+            if spots and all(isinstance(sp, ast.Lambda) for sp in spots):
+                got = set()
+                for sp in spots:
+                    got |= m.line_tests(path, sp.lineno, sp.end_lineno, runtime=True)
+                return got, "lambda"
         names = target_names(node)
         return self.scope_tests(path, c.ctx, names or None), "top statement"
 

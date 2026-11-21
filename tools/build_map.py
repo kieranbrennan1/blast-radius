@@ -27,6 +27,8 @@ lines = defaultdict(lambda: defaultdict(list))
 classes = defaultdict(list)
 opens = defaultdict(list)
 touched = defaultdict(list)
+rlines = defaultdict(lambda: defaultdict(list))
+has_rlines = False
 missing = []
 
 for i, t in enumerate(tests):
@@ -39,6 +41,11 @@ for i, t in enumerate(tests):
         touched[f].append(i)
         for ln in ls:
             lines[f][ln].append(i)
+    if "rlines" in d:
+        has_rlines = True
+        for f, ls in d["rlines"].items():
+            for ln in ls:
+                rlines[f][ln].append(i)
     for c in d["classes"]:
         classes[c].append(i)
     for f in d["opens"]:
@@ -132,6 +139,14 @@ data = {
     "touched": {f: sid(ts) for f, ts in sorted(touched.items())},
     "names": {n: sid(ts) for n, ts in sorted(name_tests.items())},
 }
+if has_rlines:
+    # Only lines whose run-time set differs from the all-code set (lines a module or class body ran).
+    data["rlines"] = {}
+    for f, m in lines.items():
+        rm = rlines.get(f, {})
+        diff = {str(ln): sid(rm.get(ln, [])) for ln, ts in m.items() if len(rm.get(ln, [])) != len(ts)}
+        if diff:
+            data["rlines"][f] = diff
 data["sets"] = sets
 with gzip.open(out, "wt", compresslevel=9) as f:
     json.dump(data, f, separators=(",", ":"))

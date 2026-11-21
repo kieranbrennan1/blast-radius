@@ -24,7 +24,7 @@ def run(t):
     if os.path.exists(dest):
         return t["number"], 0, 0
     start = time.time()
-    p = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "tracer", t["id"]],
+    p = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", os.environ.get("TRACER", "tracer"), t["id"]],
                        cwd=repo, env=dict(env, TRACE_OUT=dest), capture_output=True, text=True)
     return t["number"], p.returncode, time.time() - start
 
