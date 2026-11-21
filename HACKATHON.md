@@ -141,3 +141,9 @@ robust entry on the hidden set, not the one tuned to the practice board. What th
   Operator swaps are not where our waste is (sample already ~106 s vs NecritsSoup's 128.5 s), so trick (1) is likely
   worth little to us (guess). Trick (2) targets the 21.5 s tpcds test; worth a measured try by the session that owns
   selector.py, if Kieran says go. The 2 static "misses" (m01072, m03002) are the known test_sqlglotc truth quirk.
+
+## Rule after 28beab2 (2026-11-20 23:55, lesson L82)
+- Sort every change before shipping. **Pure win** (same tests chosen and checked, only less CPU or fewer seconds): fine
+  on the fakes' word. **Trade** (changes which tests are run or checked): the fakes can't judge it, since only 24 of ~190
+  touch optimizer/executor code; it needs board-like evidence or the board. 28beab2 was a trade judged on the fakes.
+- exec-cache (19c8105) is a pure win: TestExecutor's TPC rows parsed once in the checker, duckdb views on first use.
