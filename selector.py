@@ -904,6 +904,10 @@ class Selector:
                 whys.append("lambda")
             return got, "+".join(whys)
         names = target_names(node)
+        if c.new is None and names and self.plain_class_constant(path, c, node, names):
+            # a deleted class constant now resolves to the base class's value (or raises): the same as
+            # changing its value, so only its run-time readers among the class's users can see it
+            return self.scope_tests(path, c.ctx, names), "class constant deleted"
         if c.new is None and names:
             # deleted: anything that reads the name may now crash, even at import
             readers = set()
@@ -911,6 +915,69 @@ class Selector:
                 readers |= m.name_tests(n) or set()
             return readers | self.scope_tests(path, c.ctx, None), "top statement deleted"
         return self.scope_tests(path, c.ctx, names or None), "top statement"
+
+    def plain_class_constant(self, path, c, node, names):
+        """`NAME = <value without calls>` in a plain class body (no enum or named-tuple ancestor, no
+        decorators), where nothing reads NAME while modules or class bodies run, no dir() dispatch name,
+        and no code or test names it in a string (`__dict__.get("NAME")`, getattr, hasattr)."""
+        m = self.m
+        if m.names_rt is None or not c.ctx or c.ctx[-1][0] != "class" or any(k != "class" for k, _ in c.ctx):
+            return False
+        if not isinstance(node, ast.Assign) or not all(isinstance(t, ast.Name) for t in node.targets):
+            return False
+        if any(isinstance(x, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom)) for x in ast.walk(node.value)):
+            return False
+        for n in names:
+            if not n.isupper() or n.startswith("_") or n.endswith("_sql") or n in m.import_reads:
+                return False
+        texts, bases = self._class_index()
+        for n in names:
+            if f'"{n}"' in texts or f"'{n}'" in texts:
+                return False
+        # the class and every ancestor must be found in the repo, ending in classes with no bases
+        cls = self._new_tree
+        for kind, name in c.ctx:
+            cls = next((s for s in getattr(cls, "body", ()) if isinstance(s, ast.ClassDef) and s.name == name), None)
+            if cls is None:
+                return False
+        if cls.decorator_list:
+            return False
+        todo = [ast.unparse(b) for b in cls.bases]
+        seen = set()
+        while todo:
+            b = todo.pop().split("[")[0].split(".")[-1].strip()
+            if b in seen or b == "object":
+                continue
+            seen.add(b)
+            if "Enum" in b or b in ("Flag", "IntFlag", "NamedTuple", "TypedDict", "Protocol") or b not in bases:
+                return False
+            todo.extend(bases[b])
+        return True
+
+    def _class_index(self):
+        """All sqlglot and test source text (for string mentions) and {class name: base names} from sqlglot."""
+        if getattr(self, "_classes_idx", None) is None:
+            import re
+
+            pat = re.compile(r"^[ \t]*class[ \t]+(\w+)[ \t]*(?:\(([^)]*)\))?[ \t]*:", re.M)
+            parts, bases = [], {}
+            for top in ("sqlglot", "tests"):
+                for p in sorted((REPO / top).rglob("*.py")):
+                    try:
+                        text = p.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        continue
+                    parts.append(text)
+                    if top != "sqlglot":
+                        continue
+                    for name, args in pat.findall(text):
+                        got = bases.setdefault(name, [])
+                        for a in args.split(","):
+                            a = a.strip()
+                            if a and "=" not in a and not a.startswith("*"):
+                                got.append(a)
+            self._classes_idx = ("\n".join(parts), bases)
+        return self._classes_idx
 
     def undefined_at_import(self, c):
         """A changed module- or class-level statement that loads, while the module imports, a name the
