@@ -482,7 +482,8 @@ PROTOCOL_NAMES = {"default", "run", "emit", "read", "write", "readline", "readli
                   "encode", "decode", "format", "load_tests", "setUp", "tearDown", "setUpClass", "tearDownClass",
                   "setUpModule", "tearDownModule", "addCleanup", "doCleanups", "id", "shortDescription", "find_spec",
                   "exec_module", "create_module", "find_module", "load_module", "get_source", "get_code",
-                  "handle", "filter", "write_through", "match", "sort", "index", "count", "append", "extend"}
+                  "handle", "filter", "write_through", "match", "sort", "index", "count", "append", "extend",
+                  "_missing_", "_generate_next_value_"}
 PROTOCOL_PREFIXES = ("test", "visit", "pytest_", "assert", "fail", "generic_")
 HARMLESS_DECORATORS = {"property", "staticmethod", "classmethod", "cached_property", "abstractmethod", "overload"}
 
