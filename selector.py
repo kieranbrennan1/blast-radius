@@ -58,6 +58,8 @@ class Map:
         self.names = d.get("names", {})
         self.rlines = d.get("rlines")
         self.known = set(d.get("known", ()))
+        self.import_reads = set(d.get("import_reads", ()))
+        self.names_rt = d.get("names_rt")
         self.import_lines = d.get("import_lines", {})
         self._decoded: dict = {}
 
@@ -102,6 +104,14 @@ class Map:
 
     def name_tests(self, name: str):
         return self._get(self.names, name)
+
+    def reader_tests(self, name: str):
+        """Tests that read the name. If nothing reads it while a module or class body runs,
+        only function code can see a change, so count run-time reads only."""
+        if self.names_rt is not None and name not in self.import_reads:
+            got = self._get(self.names_rt, name)
+            return got if got is not None else set()
+        return self.name_tests(name)
 
 
 # ---------------------------------------------------------------- patches
@@ -308,7 +318,7 @@ def diff_node(o, n, ctx, out):
         out.append(Change(o, ctx, "all", new=n))
         return
     if header_dump(o) != header_dump(n):
-        out.append(Change(o, ctx, "header"))
+        out.append(Change(o, ctx, "header", new=n))
     if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
         inner = ctx + (("func", o.name),)
     elif isinstance(o, ast.ClassDef):
@@ -332,9 +342,40 @@ def diff_node(o, n, ctx, out):
             diff_lists(ol, nl, inner, o, out)
 
 
+EQUIV_OPS = {(ast.Is, ast.Eq), (ast.Eq, ast.Is), (ast.IsNot, ast.NotEq), (ast.NotEq, ast.IsNot)}
+
+
+def singleton_like(node):
+    """None, or an enum-style member such as NormalizationStrategy.UPPERCASE (not True/False: 1 == True)."""
+    if isinstance(node, ast.Constant) and node.value is None:
+        return True
+    if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1:
+        base = node.value
+        name = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else ""
+        return name[:1].isupper() and not name.isupper()
+    return False
+
+
+def same_compare(o, n):
+    """`x is None` vs `x == None` (and enum members): same result for every type sqlglot compares."""
+    if not (isinstance(o, ast.Compare) and isinstance(n, ast.Compare)) or len(o.ops) != len(n.ops):
+        return False
+    if dump(o.left) != dump(n.left) or [dump(c) for c in o.comparators] != [dump(c) for c in n.comparators]:
+        return False
+    operands = [o.left, *o.comparators]
+    for i, (a, b) in enumerate(zip(o.ops, n.ops)):
+        if type(a) is type(b):
+            continue
+        if (type(a), type(b)) not in EQUIV_OPS:
+            return False
+        if not (singleton_like(operands[i]) or singleton_like(operands[i + 1])):
+            return False
+    return True
+
+
 def diff_spots(o, n):
     """Smallest old nodes that differ; a lambda counts as one unit."""
-    if dump(o) == dump(n):
+    if dump(o) == dump(n) or same_compare(o, n):
         return []
     if type(o) is not type(n) or isinstance(o, ast.Lambda):
         return [o]
@@ -352,6 +393,23 @@ def diff_spots(o, n):
             spots += diff_spots(a, b)
         elif a != b:
             return [o]
+    return spots
+
+
+def header_spots(o, n, part):
+    if part != "header":
+        return diff_spots(o, n)
+    spots = []
+    for (name, a), (_, b) in zip(ast.iter_fields(o), ast.iter_fields(n)):
+        if name in COMPOUND_BODIES:
+            continue
+        if isinstance(a, ast.AST) and isinstance(b, ast.AST):
+            spots += diff_spots(a, b)
+        elif isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+            for x, y in zip(a, b):
+                spots += diff_spots(x, y) if isinstance(x, ast.AST) else ([o] if x != y else [])
+        elif a != b:
+            spots.append(o)
     return spots
 
 
@@ -544,6 +602,8 @@ class Selector:
                     got |= m.line_tests(path, *node_span(node, "header"))
                 return got, "insert in function"
             return set(), "insert at top"
+        if c.new is not None and not header_spots(node, c.new, c.part):
+            return set(), "equivalent edit"
         if in_func:
             return m.line_tests(path, *node_span(node, c.part)), "function line"
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -592,7 +652,7 @@ class Selector:
         if names:
             readers = set()
             for n in names:
-                got = m.name_tests(n)
+                got = m.reader_tests(n)
                 if got is None:
                     return users
                 readers |= got

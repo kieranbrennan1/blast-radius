@@ -122,6 +122,58 @@ import builtins
 
 known |= set(dir(builtins))
 
+def static_loads(tree):
+    """Names read while a module or class body runs (import time), outside function bodies."""
+    out = set()
+
+    def visit(node, top):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in node.decorator_list:
+                visit(d, top)
+            for d in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                visit(d, top)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in node.args.defaults:
+                visit(d, top)
+            return
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            out.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            out.add(node.attr)
+        for child in ast.iter_child_nodes(node):
+            visit(child, top)
+
+    visit(tree, True)
+    return out
+
+
+import_reads = set()
+for root_dir in ("sqlglot",):
+    for dirpath, _, fnames in os.walk(os.path.join(repo, root_dir)):
+        for fn in fnames:
+            if fn.endswith(".py"):
+                try:
+                    import_reads |= static_loads(ast.parse(open(os.path.join(dirpath, fn), encoding="utf-8").read()))
+                except SyntaxError:
+                    pass
+
+name_rt = defaultdict(set)
+for f, lm in lines.items():
+    rm = rlines.get(f)
+    if not rm or not f.endswith(".py") or not os.path.exists(os.path.join(repo, f)):
+        continue
+    tree = ast.parse(open(os.path.join(repo, f), encoding="utf-8").read())
+    for first, last, node in stmt_spans(tree):
+        ran = set()
+        for ln in range(first, last + 1):
+            ts = rm.get(ln)
+            if ts:
+                ran.update(ts)
+        if ran:
+            for name in mentioned(node, first, last):
+                name_rt[name] |= ran
+
 name_tests = defaultdict(set)
 for f, lm in lines.items():
     if not f.endswith(".py") or not os.path.exists(os.path.join(repo, f)):
@@ -175,6 +227,8 @@ if has_rlines:
         if diff:
             data["rlines"][f] = diff
 data["known"] = sorted(known)
+data["import_reads"] = sorted(import_reads)
+data["names_rt"] = {n: sid(ts) for n, ts in sorted(name_rt.items())}
 data["sets"] = sets
 with gzip.open(out, "wt", compresslevel=9) as f:
     json.dump(data, f, separators=(",", ":"))
