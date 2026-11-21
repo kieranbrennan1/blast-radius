@@ -26,10 +26,15 @@ earliest submission wins.
 - Perfect answers on the sample would score ~107 s + CPU. Board best 197.2 s, starter 1614.1 s.
 
 ## Slices
-1. [ ] Docker + Python 3.13 env, `make sample` runs the starter → check: 1614-ish
-2. [ ] Coverage map built and committed → check: covers all 1620 tests
-3. [ ] Selector v1 (map only) → check: 0 misses on sample
+1. [x] Docker (Colima) + Python 3.13 env, `make sample` runs the starter → 1210 s simulated locally
+2. [~] Coverage map: v1 done (missed pool-worker processes); v2 re-trace follows child processes + run-time-only lines
+3. [~] Selector v1: syntax-tree diff, lambda-aware, import-breaking names → check: 0 misses on sample + mutants
 4. [ ] Run-time verify → check: 0 misses, lower score
 5. [ ] Push public repo + submit (needs Kieran: team + yes to publish)
 
 ## Dead ends
+- Re-running the whole module tree dump per commit cost ~2 s CPU: now only statements near the edit are dumped.
+- Run-time verify (fork server): right answers, but ~1 s overhead per commit vs ~2 s saved; parked until measured idle.
+
+## Rules from Kieran
+- Ask before creating the team, making the repo public or submitting (2026-11-20).

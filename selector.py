@@ -57,6 +57,7 @@ class Map:
         self.touched = d["touched"]
         self.names = d.get("names", {})
         self.rlines = d.get("rlines")
+        self.known = set(d.get("known", ()))
         self.import_lines = d.get("import_lines", {})
         self._decoded: dict = {}
 
@@ -388,6 +389,26 @@ def target_names(node):
     return names
 
 
+def identifiers(node):
+    out = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name):
+            out.add(sub.id)
+        elif isinstance(sub, ast.Attribute):
+            out.add(sub.attr)
+        elif isinstance(sub, ast.alias):
+            out.add(sub.name.split(".")[-1])
+            out.add(sub.name.split(".")[0])
+    return out
+
+
+def defined_names(body):
+    out = set()
+    for st in body:
+        out |= target_names(st)
+    return out
+
+
 def module_name(path: str) -> str:
     mod = path[:-3].replace("/", ".")
     return mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
@@ -508,6 +529,8 @@ class Selector:
             # a statement only in the new file: at class/module level it can define or override names
             if in_func:
                 return set(), "new line"
+            if isinstance(node, (ast.Import, ast.ImportFrom)) or (m.known and identifiers(node) - m.known):
+                return m.file_tests(path), "new top statement may break import"
             names = target_names(node)
             return self.scope_tests(path, c.ctx, names or None), "new top statement"
         if c.part == "insert":
@@ -536,6 +559,10 @@ class Selector:
             return inner | self.scope_tests(
                 path, c.ctx, {node.name}
             ), "class header" if c.part == "header" else "class changed"
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and not c.ctx:
+            return m.file_tests(path), "import changed"
+        if c.new is not None and m.known and identifiers(c.new) - m.known:
+            return m.file_tests(path), "unknown name at import time"
         if c.new is not None and m.rlines is not None:
             spots = diff_spots(node, c.new)
             if spots and all(isinstance(sp, ast.Lambda) for sp in spots):
@@ -544,6 +571,12 @@ class Selector:
                     got |= m.line_tests(path, sp.lineno, sp.end_lineno, runtime=True)
                 return got, "lambda"
         names = target_names(node)
+        if c.new is None and names:
+            # deleted: anything that reads the name may now crash, even at import
+            readers = set()
+            for n in names:
+                readers |= m.name_tests(n) or set()
+            return readers | self.scope_tests(path, c.ctx, None), "top statement deleted"
         return self.scope_tests(path, c.ctx, names or None), "top statement"
 
     def class_tests(self, path, ctx):

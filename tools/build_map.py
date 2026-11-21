@@ -107,6 +107,21 @@ def mentioned(node, first, last):
     return out
 
 
+known = set()
+for root_dir in ("sqlglot", "tests"):
+    for dirpath, _, fnames in os.walk(os.path.join(repo, root_dir)):
+        for fn in fnames:
+            if fn.endswith(".py"):
+                try:
+                    tree = ast.parse(open(os.path.join(dirpath, fn), encoding="utf-8").read())
+                except SyntaxError:
+                    continue
+                for first, last, node in stmt_spans(tree):
+                    known |= mentioned(node, 1, 10**9)
+import builtins
+
+known |= set(dir(builtins))
+
 name_tests = defaultdict(set)
 for f, lm in lines.items():
     if not f.endswith(".py") or not os.path.exists(os.path.join(repo, f)):
@@ -159,6 +174,7 @@ if has_rlines:
         diff = {str(ln): sid(rm.get(ln, [])) for ln, ts in m.items() if len(rm.get(ln, [])) != len(ts)}
         if diff:
             data["rlines"][f] = diff
+data["known"] = sorted(known)
 data["sets"] = sets
 with gzip.open(out, "wt", compresslevel=9) as f:
     json.dump(data, f, separators=(",", ":"))
