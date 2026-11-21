@@ -13,6 +13,7 @@ The map (keyed by test id, so it survives renumbering):
 """
 
 import ast
+import glob
 import gzip
 import json
 import os
@@ -37,6 +38,17 @@ for i, t in enumerate(tests):
         missing.append(t["id"])
         continue
     d = json.load(open(path))
+    # merge what child processes (pool workers) recorded
+    for extra in glob.glob(path + ".*"):
+        try:
+            e = json.load(open(extra))
+        except ValueError:
+            continue
+        for key in ("lines", "rlines"):
+            for f, ls in e.get(key, {}).items():
+                d.setdefault(key, {})[f] = sorted(set(d.get(key, {}).get(f, [])) | set(ls))
+        d["classes"] = sorted(set(d["classes"]) | set(e.get("classes", [])))
+        d["opens"] = sorted(set(d["opens"]) | set(e.get("opens", [])))
     for f, ls in d["lines"].items():
         touched[f].append(i)
         for ln in ls:

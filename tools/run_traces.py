@@ -15,7 +15,7 @@ jobs = int(sys.argv[5]) if len(sys.argv) > 5 else os.cpu_count()
 tools = os.path.dirname(os.path.abspath(__file__))
 tests = json.load(open(tests_json))["tests"]
 os.makedirs(out, exist_ok=True)
-env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{repo}:{tools}", TRACE_ROOT=repo,
+env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{repo}:{tools}/trace_site", TRACE_ROOT=repo,
            PATH=os.path.dirname(py) + ":" + os.environ["PATH"], PYTHONDONTWRITEBYTECODE="1")
 
 
@@ -24,7 +24,7 @@ def run(t):
     if os.path.exists(dest):
         return t["number"], 0, 0
     start = time.time()
-    p = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", os.environ.get("TRACER", "tracer"), t["id"]],
+    p = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", t["id"]],
                        cwd=repo, env=dict(env, TRACE_OUT=dest), capture_output=True, text=True)
     return t["number"], p.returncode, time.time() - start
 

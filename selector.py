@@ -122,6 +122,7 @@ def parse_patch(text: str):
             tag, body = (line[:1] or " "), line[1:]
             if tag == "\\":
                 continue
+            hunk["seq"].append(tag)
             if tag in (" ", "-"):
                 hunk["old"].append(body)
                 hunk["oleft"] -= 1
@@ -158,6 +159,7 @@ def parse_patch(text: str):
                 "olen": olen,
                 "old": [],
                 "new": [],
+                "seq": [],
                 "oleft": olen,
                 "nleft": nlen,
             }
@@ -200,6 +202,52 @@ def dump(node):
     return ast.dump(node, annotate_fields=False, include_attributes=False)
 
 
+class Lines:
+    """Which old/new lines the patch touched, and where each untouched old line moved to."""
+
+    old_changed: set = set()
+    new_changed: set = set()
+    o2n: dict = {}
+
+    @classmethod
+    def load(cls, hunks, old_count):
+        cls.old_changed, cls.new_changed, cls.o2n = set(), set(), {}
+        o = n = 1
+        for h in hunks:
+            start = h["start"] if h["olen"] else h["start"] + 1
+            while o < start:
+                cls.o2n[o] = n
+                o += 1
+                n += 1
+            for tag in h["seq"]:
+                if tag == " ":
+                    cls.o2n[o] = n
+                    o += 1
+                    n += 1
+                elif tag == "-":
+                    cls.old_changed.add(o)
+                    o += 1
+                else:
+                    cls.new_changed.add(n)
+                    cls.old_changed.update((o - 1, o))  # an insertion touches its neighbours
+                    n += 1
+        while o <= old_count + 1:
+            cls.o2n[o] = n
+            o += 1
+            n += 1
+
+
+def stmt_key(node, old):
+    first, last = node_span(node, "all")
+    if old:
+        if any(ln in Lines.old_changed for ln in range(first, last + 1)):
+            return dump(node)
+        return ("same", Lines.o2n.get(first), Lines.o2n.get(last))
+    if any(ln in Lines.new_changed for ln in range(first, last + 1)):
+        return dump(node)
+    return ("same", first, last)
+
+
 class Change:
     __slots__ = ("node", "ctx", "part", "neighbors", "new")
 
@@ -224,8 +272,8 @@ def header_dump(node):
 
 
 def diff_lists(old, new, ctx, parent, out):
-    od = [dump(s) for s in old]
-    nd = [dump(s) for s in new]
+    od = [stmt_key(s, True) for s in old]
+    nd = [stmt_key(s, False) for s in new]
     if od == nd:
         return
     sm = difflib.SequenceMatcher(None, od, nd, autojunk=False)
@@ -434,10 +482,11 @@ class Selector:
             new_tree = ast.parse(new_text)
         except (SyntaxError, ValueError):
             return self.m.file_tests(path), "syntax error"
-        if dump(old_tree) == dump(new_tree):
-            return set(), "no code change"
+        Lines.load(hunks, old_text.count("\n") + 1)
         changes: list = []
         diff_lists(old_tree.body, new_tree.body, (), old_tree, changes)
+        if not changes:
+            return set(), "no code change"
         tests: set = set()
         whys = []
         for c in changes:
