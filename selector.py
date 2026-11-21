@@ -987,6 +987,82 @@ SLOW_SETUP = "tests/test_executor.py::TestExecutor::"
 SLOW_SETUP_MS = 2200
 AFTER_FAIL_MIN_MS = float(os.environ.get("BR_AFTER_FAIL_MIN_MS", "1e9"))  # failing tests run slowly: stop at the first  # TestExecutor.setUpClass, paid in every child that runs one
 
+# The slowest tests are never run as they are (a run costs as much CPU as it saves). A stand-in runs the
+# same code on a smaller input (standins.py); if it passes on the patched code, the real test is dropped.
+STANDINS = {
+    "tests/test_parser.py::TestParser::test_max_nodes": ("standins.py::MaxNodes::test_small", 1200),
+    "tests/test_generator.py::TestGenerator::test_generator_memory": ("standins.py::GeneratorMemory::test_small", 2500),
+}
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_STANDIN = "standins_tpcds.py::Tpcds::test_q"
+TPCDS_MAX_MS = int(os.environ.get("BR_TPCDS_MAX_MS", "6000"))  # CPU budget for its queries
+PROBE_MIN = 3
+# A probe (some of the queries that run the changed code) drops the real test only when the commit's other
+# candidates were checked too and all passed. In ~200 labelled commits tpcds never failed alone.
+TPCDS_PROBE = os.environ.get("BR_TPCDS_PROBE", "0") == "1"  # measured: ~14 s saved for ~14 s CPU on 102 fakes, so off
+STANDIN_OFF = os.environ.get("BR_STANDINS", "1") != "1"
+
+
+class TpcdsMap:
+    """Which TPC-DS queries run which sqlglot functions (tools/trace_tpcds.py on the pinned commit)."""
+
+    def __init__(self):
+        self.ok = False
+        for p in (os.environ.get("BR_TPCDS_MAP"), MAP.parent / "tpcds.json", Path(__file__).parent / "map" / "tpcds.json"):
+            if p and Path(p).exists():
+                d = json.loads(Path(p).read_text())
+                self.funcs = d["funcs"]  # index -> "path::qualname"
+                self.common = set(d["common"])  # function indexes every run uses (loading and shipping tables)
+                self.queries = d["queries"]  # [{"i", "ms", "funcs": [idx], "tables": [...]}]
+                self.table_ms = d["table_ms"]
+                self.base_ms = d["base_ms"]
+                self.users: dict = {}
+                for q in self.queries:
+                    for f in q["funcs"]:
+                        self.users.setdefault(self.funcs[f], []).append(q)
+                self.common_names = {self.funcs[f] for f in self.common}
+                self.ok = True
+                return
+
+    def cost(self, qs):
+        tables = set().union(*(q["tables"] for q in qs)) if qs else set()
+        return self.base_ms + sum(q["ms"] for q in qs) + sum(self.table_ms.get(t, 200) for t in tables)
+
+    def plan(self, changed, budget):
+        """changed: 'path::qualname' of every changed function.
+
+        (query numbers, est ms, exact?) or None. Exact: every query that runs a changed function.
+        Otherwise a probe within the budget: for each changed function the cheapest query that runs it,
+        then the cheapest other such queries (at least PROBE_MIN queries when there are that many)."""
+        if not self.ok or not changed:
+            return None
+        if changed & self.common_names:
+            return None  # every query could see it: as dear as the real test
+        hit = {}
+        for name in changed:
+            for q in self.users.get(name, ()):
+                hit[q["i"]] = q
+        if not hit:
+            return None  # the map says tpcds runs none of them: nothing to check, keep the test (be safe)
+        if self.cost(list(hit.values())) <= budget:
+            return sorted(hit), self.cost(list(hit.values())), True
+        pick = {}
+        for name in sorted(changed):
+            qs = self.users.get(name)
+            if qs:
+                q = min(qs, key=lambda q: (q["ms"], q["i"]))
+                pick[q["i"]] = q
+        for q in sorted(hit.values(), key=lambda q: (q["ms"], q["i"])):
+            if q["i"] in pick:
+                continue
+            if len(pick) >= PROBE_MIN and self.cost(list(pick.values()) + [q]) > budget:
+                break
+            pick[q["i"]] = q
+        ms = self.cost(list(pick.values()))
+        if ms > 1.5 * budget:
+            return None
+        return sorted(pick), ms, False
+
 
 class Checker:
     """Decides, per commit, whether running the cheap candidates beats just selecting them."""
@@ -999,6 +1075,8 @@ class Checker:
         self.starts = 0
         self.no_heavy = False
         self.heavy_paid = False
+        self.tpcds = None
+        self.number_of = {v: k for k, v in ids_by_number.items()}
 
     def verifier(self):
         if self.v is None:
@@ -1037,10 +1115,32 @@ class Checker:
             and not self.ids[t].startswith(NEVER_VERIFY_FILES)
         ]
 
+    def standins(self, files, pairs, numbers):
+        """[(real test number, [stand-in ids], est ms, heavy?)] for the slow tests among numbers."""
+        if STANDIN_OFF:
+            return []
+        out = []
+        for t in numbers:
+            tid = self.ids.get(t)
+            if tid in STANDINS and tid.split("::")[0] not in files:
+                sid, ms = STANDINS[tid]
+                out.append((t, [sid], ms, False))
+            elif tid == TPCDS and pairs and not self.no_heavy and "tests/test_executor.py" not in files:
+                if self.tpcds is None:
+                    self.tpcds = TpcdsMap()
+                changed = {f"{p}::{o.co_qualname}" for p, _fn, o, _n, _own in pairs}
+                got = self.tpcds.plan(changed, TPCDS_MAX_MS)
+                if got and (got[2] or TPCDS_PROBE):
+                    # exact -> heavy=True; a probe is marked "probe" and needs other candidates beside it
+                    out.append((t, [f"{TPCDS_STANDIN}{i}" for i in got[0]], got[1], True if got[2] else "probe"))
+        return out
+
     def estimate(self, patch_text, numbers):
-        """(gain ms, run cost ms, files, test modules, tests to run, reload size) for checking this commit, or None."""
+        """(gain ms, run cost ms, files, test modules, tests to run, reload size, stand-ins) for checking this
+        commit, or None."""
         d = self.durations
-        if not self.candidates(numbers, 7000):
+        slow = [t for t in numbers if self.ids.get(t) in STANDINS or self.ids.get(t) == TPCDS]
+        if not self.candidates(numbers, 7000) and not slow:
             return None
         files = self.files(patch_text)
         if files is None:
@@ -1048,11 +1148,13 @@ class Checker:
         from fastverify import Verifier
 
         reload_n = 0
-        if Verifier.static_pairs(str(REPO), files) is None:
+        pairs = Verifier.static_pairs(str(REPO), files)
+        if pairs is None:
             reload = self.verifier().reload_set(files)
             if reload is None:
                 return None
             reload_n = len(reload[1])
+        sts = self.standins(files, pairs, numbers) if slow else []
         best = None
         changed = set(files)
         options = []
@@ -1061,24 +1163,35 @@ class Checker:
             options.append(base)
             # leave out tests whose class set-up is slow (they are kept, not run)
             options.append([t for t in base if not self.ids[t].startswith(SLOW_SETUP)])
-        for cand in options:
-            if not cand:
-                continue
-            keep = set(numbers) - set(cand)
-            gain = pack_cost(numbers, d) - pack_cost(keep, d)
-            est = 60 + RUN_RATIO * sum(d[t] for t in cand) + 5 * reload_n
-            if any(self.ids[t].startswith(SLOW_SETUP) for t in cand):
-                est += SLOW_SETUP_MS
-            if not self.heavy_paid and any(self.ids[t].startswith(HEAVY_FILES) for t in cand):
-                est += HEAVY_IMPORT_MS
-            if est > GAIN_SHARE * gain:
-                continue
-            if best is None or gain - est > best[0] - best[1]:
-                mods = {self.ids[t].split("::")[0][:-3].replace("/", ".") for t in cand}
-                best = (gain, est, files, mods, cand, reload_n)
+        uses = [[]]
+        if sts:
+            uses.append(sts)
+            if len(sts) > 1:
+                uses += [[s] for s in sts]
+        for cand in options + [[]]:
+            for use in uses:
+                use = [s for s in use if s[0] not in cand]  # the real test is run: no stand-in needed
+                if not cand:
+                    use = [s for s in use if s[3] != "probe"]  # a probe never decides alone
+                if not cand and not use:
+                    continue
+                keep = set(numbers) - set(cand) - {s[0] for s in use}
+                gain = pack_cost(numbers, d) - pack_cost(keep, d)
+                est = 60 + RUN_RATIO * sum(d[t] for t in cand) + 5 * reload_n + sum(s[2] for s in use)
+                if any(self.ids[t].startswith(SLOW_SETUP) for t in cand):
+                    est += SLOW_SETUP_MS
+                heavy = any(self.ids[t].startswith(HEAVY_FILES) for t in cand) or any(s[3] for s in use)
+                if not self.heavy_paid and heavy:
+                    est += HEAVY_IMPORT_MS
+                if est > GAIN_SHARE * gain:
+                    continue
+                if best is None or gain - est > best[0] - best[1]:
+                    mods = {self.ids[t].split("::")[0][:-3].replace("/", ".") for t in cand}
+                    mods |= {sid.split("::")[0][:-3] for s in use for sid in s[1]}
+                    best = (gain, est, files, mods, cand, reload_n, use)
         if best is None or best[0] < 1000:
             return None
-        if any(self.ids[t].startswith(HEAVY_FILES) for t in best[4]):
+        if any(self.ids[t].startswith(HEAVY_FILES) for t in best[4]) or any(s[3] for s in best[6]):
             self.heavy_paid = True
         return best
 
@@ -1151,22 +1264,35 @@ class Checker:
                 pass
         self.kill()  # and any test child still running
 
-    def check(self, files, numbers, cand):
+    def check(self, files, numbers, cand, use=()):
         d = self.durations
         heavy = [t for t in cand if self.ids[t].startswith(HEAVY_FILES)]
-        if heavy and self.no_heavy:
-            cand = [t for t in cand if t not in set(heavy)]
-            if not cand:
-                return numbers, "heavy tests unavailable"
-        order = sorted(cand, key=lambda t: (d[t], t))
-        ids = [self.ids[t] for t in order]
+        if self.no_heavy:
+            use = [s for s in use if not s[3]]
+            if heavy:
+                cand = [t for t in cand if t not in set(heavy)]
+        if not cand and not use:
+            return numbers, "heavy tests unavailable"
+        heavy = heavy or any(s[3] for s in use)
+        # stand-ins run after the real candidates of similar cost; each counts as (est ms, id)
+        jobs = [(d[t], self.ids[t]) for t in cand]
+        for _real, sids, ms, _h in use:
+            jobs += [(ms / len(sids), sid) for sid in sids]
+        jobs.sort()
+        ids = [j[1] for j in jobs]
+        order = [self.number_of[i] for i in ids if i in self.number_of]
         # after a failure, keep checking only if dropping the rest still pays (e.g. a test edit plus a code edit)
-        est = RUN_RATIO * sum(d[t] for t in order)
-        late_gain = pack_cost(numbers, d) - pack_cost(set(numbers) - set(order), d) - WORKER_MS - max(d[t] for t in order)
+        est = RUN_RATIO * sum(d[t] for t in order) + sum(s[2] for s in use)
+        everything = set(order) | {s[0] for s in use}
+        late_gain = pack_cost(numbers, d) - pack_cost(set(numbers) - everything, d) - WORKER_MS - max(j[0] for j in jobs)
+        limits = {self.ids[t]: max(3.0, 8 * d[t] / 1000) for t in order}  # slower = kept, never dropped
+        for _real, sids, ms, _h in use:
+            for sid in sids:
+                limits[sid] = max(5.0, 3 * ms / 1000)
         req = {
             "files": {p: [o, n] for p, (o, n) in files.items()},
             "ids": ids,
-            "limits": {self.ids[t]: max(3.0, 8 * d[t] / 1000) for t in order},  # slower = kept, never dropped
+            "limits": limits,
             # after a failure, spend at most half of what dropping the rest could still save
             "stop_on_fail": True if late_gain < AFTER_FAIL_MIN_MS else round(late_gain / 2000, 3),
         }
@@ -1191,10 +1317,19 @@ class Checker:
         if res is None:
             return numbers, ans.get("how", "?")
         dropped = {t for t in order if res.get(self.ids[t]) is True}
-        failed = sum(1 for t in order if res.get(self.ids[t]) is False)
+        failed = sum(1 for i in ids if res.get(i) is False)
+        stood = []
+        clean = all(res.get(i) is True for i in ids)  # everything sent ran and passed
+        for real, sids, _ms, kind in use:
+            # every stand-in of the real test ran on the patched code and passed (a probe: and all the rest too)
+            if sids and all(res.get(sid) is True for sid in sids) and (kind != "probe" or clean):
+                dropped.add(real)
+                stood.append(self.ids[real].split("::")[-1])
         saved = pack_cost(numbers, d) - pack_cost(set(numbers) - dropped, d)
         return set(numbers) - dropped, (
-            f"{ans['how']}: ran {len(res)}/{len(order)}, {failed} failed, dropped {len(dropped)}, saved {saved} ms for {ans.get('cpu_ms')} ms cpu"
+            f"{ans['how']}: ran {len(res)}/{len(ids)}, {failed} failed, dropped {len(dropped)}"
+            + (f" (stand-ins passed: {','.join(stood)})" if stood else "")
+            + f", saved {saved} ms for {ans.get('cpu_ms')} ms cpu"
         )
 
 
@@ -1335,7 +1470,7 @@ def _main(run, tests):
         for r in todo:
             t0 = time.process_time() + sum(os.times()[2:4])
             try:
-                r[1], why = checker.check(r[3][2], r[1], r[3][4])
+                r[1], why = checker.check(r[3][2], r[1], r[3][4], r[3][6])
                 why += f" [{(time.process_time() + sum(os.times()[2:4]) - t0) * 1000:.0f} ms, est {r[3][1]:.0f}, gain {r[3][0]}]"
             except Exception as e:  # noqa: BLE001
                 why = f"check error {type(e).__name__}"

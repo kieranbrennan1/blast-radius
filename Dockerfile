@@ -24,10 +24,11 @@ COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir --no-deps -r /app/requirements.lock
 
 COPY map/map.json.gz /app/map.json.gz
-COPY selector.py fastverify.py tools/pickle_map.py tools/import_graph.py /app/
+COPY map/tpcds.json /app/tpcds.json
+COPY selector.py fastverify.py standins.py standins_tpcds.py tools/pickle_map.py tools/import_graph.py /app/
 RUN python /app/pickle_map.py /app/map.json.gz /app/map.pkl && rm /app/map.json.gz \
     && python /app/import_graph.py /app/sqlglot /app/imports.json \
-    && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py /app/fastverify.py \
+    && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py /app/fastverify.py /app/standins.py /app/standins_tpcds.py \
        /app/sqlglot/sqlglot /app/sqlglot/tests >/dev/null || true \
     && chmod -R a+rX /app /usr/local/lib/python3.13
 
