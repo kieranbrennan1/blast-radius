@@ -153,3 +153,8 @@ Arm64 A/B vs main f35c32a: sample 106.1 = 106.1; 134 fakes 1065.3 = 1065.3, 0 mi
 `BR_GAIN_SHARE=0.5` was worse (+31 s tests, -12.7 s CPU). m01079's tpcds label is a false timeout (real test passes).
 Next lever (not built): import-state fingerprint for module-level / class-header / decorator edits: ~160 s of our
 363 s waste on the fakes (m03020, m01060, m01047, m01058, m03023, m01073 fall back to 700-1,600 tests).
+- 2026-11-21 ~02:30, import-state study: name-level readers are too broad here (SUPPORTS_TABLE_QUERY read at run time
+  by 1,488 tests, FUNCTIONS 1,266, FUNCTION_PARSERS 1,276), so an import-state diff by name alone would only save
+  m01060. Built instead: edits inside a `typing.overload` stub select nothing (same name required; stubs never run).
+  Arm64, checks on: 134 fakes **1037.9 s** (main 1065.3), 0 misses, CPU 39.4 vs 38.8; sample 106.1 = 106.1.
+  Bigger version (dict-key-level read map, wins m01058/m03023 ~+54 s on the fakes) needs a full re-trace of 1,620 tests.
