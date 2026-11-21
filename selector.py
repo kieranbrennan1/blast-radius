@@ -476,6 +476,14 @@ def node_span(node, part):
     return first, last
 
 
+# methods Python, unittest, pytest or the standard library call by name without the caller's source saying it
+PROTOCOL_NAMES = {"default", "run", "emit", "read", "write", "readline", "readlines", "close", "flush", "fileno",
+                  "keys", "items", "values", "get", "pop", "setdefault", "update", "copy", "send", "throw",
+                  "encode", "decode", "format", "load_tests", "setUp", "tearDown", "setUpClass", "tearDownClass",
+                  "setUpModule", "tearDownModule", "addCleanup", "doCleanups", "id", "shortDescription", "find_spec",
+                  "exec_module", "create_module", "find_module", "load_module", "get_source", "get_code",
+                  "handle", "filter", "write_through", "match", "sort", "index", "count", "append", "extend"}
+PROTOCOL_PREFIXES = ("test", "visit", "pytest_", "assert", "fail", "generic_")
 HARMLESS_DECORATORS = {"property", "staticmethod", "classmethod", "cached_property", "abstractmethod", "overload"}
 
 
@@ -911,6 +919,7 @@ class Selector:
             return set(), "no code change"
         tests: set = set()
         whys = []
+        self._n_changes = len(changes)
         for c in changes:
             got, why = self.change_tests(path, c)
             tests |= got
@@ -977,6 +986,10 @@ class Selector:
                 # a typing.overload stub never runs: the next def of the same name replaces it at import, and
                 # its new defaults/decorators passed import_time_risk above (nothing reads typing's registry)
                 return set(), "overload stub"
+            if c.new is not None and c.part == "header":
+                got = self.default_callers(path, c, node, c.new)
+                if got is not None:
+                    return got & body, "default value"  # whoever sees the new default also ran the body
             return body, "def header"
         if isinstance(node, ast.ClassDef):
             inner = self.class_tests(path, c.ctx + (("class", node.name),))
@@ -1067,6 +1080,152 @@ class Selector:
                 return False
             todo.extend(bases[b])
         return True
+
+    def default_callers(self, path, c, old, new):
+        """Only literal default values of a def changed: just calls that leave such a parameter out can see it.
+        Returns the tests that ran such a call (any line of the call, every sqlglot and test file), or None
+        when that cannot be proved: the def is reached some way other than a plain call by its name (a
+        reference, an alias, a string naming it anywhere, incl. docstrings run by doctest, a dunder, a *_sql
+        dispatch name, a name Python or a library calls by protocol), it has decorators, the parameter is
+        positional-only, a calling file is not in the map, or this patch changes anything else."""
+        m = self.m
+        if getattr(self, "_py_paths", None) != {path} or getattr(self, "_n_changes", 0) != 1:
+            return None
+        if type(old) is not type(new) or not isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        name = old.name
+        if name != new.name or old.decorator_list or new.decorator_list or any(k != "class" for k, _ in c.ctx):
+            return None
+        if name.startswith("__") or name.endswith("_sql") or name in PROTOCOL_NAMES or name.startswith(PROTOCOL_PREFIXES):
+            return None
+        oa, na = old.args, new.args
+        if len(oa.defaults) != len(na.defaults) or [k is None for k in oa.kw_defaults] != [k is None for k in na.kw_defaults]:
+            return None
+        a, b = copy.deepcopy(old), copy.deepcopy(new)
+        a.args.defaults = b.args.defaults = []
+        a.args.kw_defaults = b.args.kw_defaults = []
+        if dump(a) != dump(b):
+            return None
+
+        def literal(x):
+            return isinstance(x, ast.Constant) or (
+                isinstance(x, ast.UnaryOp) and isinstance(x.op, (ast.USub, ast.UAdd)) and isinstance(x.operand, ast.Constant)
+            )
+
+        allp = [x.arg for x in oa.posonlyargs + oa.args]
+        changed = []  # (parameter, index among positional parameters or None)
+        for i, (x, y) in enumerate(zip(oa.defaults, na.defaults)):
+            if dump(x) != dump(y):
+                k = len(allp) - len(oa.defaults) + i
+                if k < len(oa.posonlyargs) or not (literal(x) and literal(y)):
+                    return None
+                changed.append((allp[k], k))
+        for arg, x, y in zip(oa.kwonlyargs, oa.kw_defaults, na.kw_defaults):
+            if x is not None and dump(x) != dump(y):
+                if not (literal(x) and literal(y)):
+                    return None
+                changed.append((arg.arg, None))
+        if not changed:
+            return None
+        method = bool(c.ctx)
+        import re
+
+        word = re.compile(r"\b" + re.escape(name) + r"\b")
+        if getattr(self, "_src_cache", None) is None:
+            self._src_cache = {}
+            for top in ("sqlglot", "tests"):
+                for p in sorted((REPO / top).rglob("*.py")):
+                    try:
+                        self._src_cache[p.relative_to(REPO).as_posix()] = [p.read_text(encoding="utf-8", errors="ignore"), None]
+                    except OSError:
+                        self._src_cache[p.relative_to(REPO).as_posix()] = [None, None]
+
+        def passes(call):
+            for p, k in changed:
+                if any(kw.arg == p for kw in call.keywords):
+                    continue
+                if k is not None and not any(isinstance(x, ast.Starred) for x in call.args) and len(call.args) >= k + 1:
+                    continue  # over-counts one for a bound self/cls: the safe side
+                return False
+            return True
+
+        if getattr(self, "_data_text", None) is None:
+            parts = []
+            for top in ("sqlglot", "tests"):
+                for p in sorted((REPO / top).rglob("*")):
+                    if p.is_file() and p.suffix not in (".py", ".pyc", ".so", ".png", ".gz"):
+                        try:
+                            parts.append(p.read_text(encoding="utf-8", errors="ignore"))
+                        except OSError:
+                            parts.append(name)  # unreadable: assume it names everything
+            self._data_text = "\n".join(parts)
+        if word.search(self._data_text):
+            return None
+        got = set()
+        for rel, entry in self._src_cache.items():
+            text = entry[0]
+            if text is None:
+                return None
+            if not word.search(text) or rel == "sqlglot/__main__.py":
+                continue  # __main__ runs only under `python -m sqlglot`, which no test does (test_docs skips it)
+            if entry[1] is None:
+                try:
+                    entry[1] = ast.parse(text)
+                except (SyntaxError, ValueError):
+                    return None
+            tree = entry[1]
+            calls = []
+            docs = set()
+            for d in ast.walk(tree):
+                if isinstance(d, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and d.body:
+                    first = d.body[0]
+                    if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                        docs.add(id(first.value))
+            stack = [(tree, None, False, None)]
+            while stack:
+                node, parent, in_fn, stmt = stack.pop()
+                if isinstance(node, ast.stmt):
+                    stmt = node
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and word.search(node.value):
+                    if id(node) in docs:
+                        if ">>>" in node.value:
+                            return None  # a doctest may call it
+                        continue  # prose: nothing runs it
+                    # a string naming it (getattr, mock.patch.object, a dispatch table): whoever uses the string
+                    # loaded it, so ran the statement holding it (one fresh process per traced test)
+                    if rel not in m.lines or stmt is None:
+                        return None
+                    got |= m.line_tests(rel, stmt.lineno, stmt.end_lineno)
+                    continue
+                ref = isinstance(node, ast.alias) and (node.name == name or node.name.endswith("." + name)) and node.asname
+                if isinstance(node, ast.Attribute) and node.attr == name or (
+                    isinstance(node, ast.Name) and node.id == name and not (method and in_fn)
+                ):
+                    if isinstance(parent, ast.Call) and parent.func is node:
+                        calls.append(parent)
+                    else:
+                        ref = True
+                if ref:
+                    # a reference or alias (wraps=, a callback, a dispatch table): any call through it, with any
+                    # arguments, comes after the process ran this statement, so its tests are a safe superset
+                    if rel not in m.lines or stmt is None:
+                        return None
+                    got |= m.line_tests(rel, stmt.lineno, stmt.end_lineno)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    # only the body runs in the function's scope; decorators and defaults run where the def is
+                    inner = node.body if isinstance(node.body, list) else [node.body]
+                    for child in ast.iter_child_nodes(node):
+                        stack.append((child, node, in_fn or any(child is x for x in inner), stmt))
+                else:
+                    for child in ast.iter_child_nodes(node):
+                        stack.append((child, node, in_fn, stmt))
+            for call in calls:
+                if passes(call):
+                    continue
+                if rel not in m.lines:
+                    return None
+                got |= m.line_tests(rel, call.lineno, call.end_lineno)
+        return got
 
     def import_reads_elsewhere(self, path, c, name):
         """True when every load of `name` made while a sqlglot or test module or class body runs provably
