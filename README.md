@@ -26,7 +26,16 @@ Picks which sqlglot tests a patch can break, for RWX's Blast Radius track at the
    with `unittest`, process pools run in-process, and a failure, error, timeout or crash keeps the test.
    It is only used when the expected saving beats the CPU it costs, and a function that already ran
    while modules were imported is never swapped (its results may be cached).
-4. **Packing**: the chosen tests are spread, longest first, over the number of workers (1–8) that costs least.
+4. **Never an invalid run**: every commit always has a safe answer (all tests) until the selector has a
+   better one. Any error, or a time limit of about 2.4 s a commit, prints what is ready. Patches are checked
+   against the real file before they are trusted, the checking process runs in its own process group with
+   CPU limits on every test child, and answers go out on a private copy of stdout so nothing a test prints can
+   corrupt them.
+5. **Import-time changes**: a new class, a new dunder name, a new decorator or default value that runs at
+   import, a changed class header, or a changed top-level line using a name the module never defines selects
+   every test that imports the file. A new method selects the tests that use its class (methods such as
+   `*_sql` are found with `dir()`, not by name). Adding or removing a file selects the tests that list its folder.
+6. **Packing**: the chosen tests are spread, longest first, over the number of workers (1–8) that costs least.
 
 No table from patches or kinds of edit to failing tests is used: every decision comes from the map of the
 pinned commit and the patch's own syntax tree.
