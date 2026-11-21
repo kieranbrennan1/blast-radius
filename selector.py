@@ -952,6 +952,10 @@ class Selector:
                 # a new method is found through dir()/getattr (e.g. the generator's *_sql dispatch), not by name
                 return self.class_tests(path, c.ctx), "new method"
             names = target_names(node)
+            if self.dead_class_store(c, node, names):
+                # the class body runs top to bottom and a later line stores the same name before anything
+                # mentions it: the class ends up exactly as before
+                return set(), "class constant overwritten later in the class body"
             if (
                 names
                 and c.ctx
@@ -1051,6 +1055,50 @@ class Selector:
                 readers |= m.name_tests(n) or set()
             return readers | self.scope_tests(path, c.ctx, None), "top statement deleted"
         return self.scope_tests(path, c.ctx, names or None), "top statement"
+
+    def dead_class_store(self, c, node, names):
+        """A statement only in the new file, `NAME = <literal>` directly in a class body, followed later in
+        that same class body by an unconditional `NAME = <value not mentioning NAME>` with no statement in
+        between mentioning NAME at all (as text, so decorators, comprehensions and strings count): the first
+        value is never seen. A literal runs no code and has no __set_name__; no class in sqlglot customizes
+        its namespace (__prepare__) or reads locals() in a class body, and a metaclass or __init_subclass__
+        only sees the finished namespace."""
+        if len(names) != 1 or not c.ctx or any(k != "class" for k, _ in c.ctx):
+            return False
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            return False
+        try:
+            ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return False
+        name = node.targets[0].id
+        if name.startswith("__") or "__prepare__" in self._new_text or "locals()" in self._new_text:
+            return False
+        cls = self._new_tree
+        for _kind, nm in c.ctx:
+            cls = next((s for s in getattr(cls, "body", ()) if isinstance(s, ast.ClassDef) and s.name == nm), None)
+            if cls is None:
+                return False
+        idx = next((i for i, s in enumerate(cls.body) if s is node), None)
+        if idx is None:
+            return False
+        for s in cls.body[idx + 1 :]:
+            if isinstance(s, ast.Assign) and len(s.targets) == 1:
+                tgt = s.targets[0]
+            elif isinstance(s, ast.AnnAssign) and s.value is not None:
+                tgt = s.target
+            else:
+                tgt = None
+            if (
+                isinstance(tgt, ast.Name)
+                and tgt.id == name
+                and name not in ast.unparse(s.value)
+                and (not isinstance(s, ast.AnnAssign) or name not in ast.unparse(s.annotation))
+            ):
+                return True
+            if name in ast.unparse(s) or any(name in ast.unparse(d) for d in getattr(s, "decorator_list", ())):
+                return False
+        return False
 
     def plain_class_constant(self, path, c, node, names):
         """`NAME = <value without calls>` in a plain class body (no enum or named-tuple ancestor, no
