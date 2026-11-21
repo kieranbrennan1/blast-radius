@@ -503,6 +503,72 @@ def import_time_risk(old, new):
     return False
 
 
+_BUILTINS = set(dir(__import__("builtins"))) | {"__name__", "__file__", "__doc__", "__spec__", "__package__",
+                                                 "__loader__", "__path__", "__builtins__", "__annotations__",
+                                                 "__module__", "__qualname__", "__class__"}
+
+
+def module_names(tree):
+    """Every name a module defines at its top level (None if it star-imports)."""
+    out = set(_BUILTINS)
+
+    def visit(n):
+        if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
+            raise LookupError
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                out.add((a.asname or a.name).split(".")[0])
+            return
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(n.name)
+            return
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            out.add(n.id)
+        if isinstance(n, (ast.Global, ast.Nonlocal)):
+            out.update(n.names)
+        for ch in ast.iter_child_nodes(n):
+            visit(ch)
+
+    try:
+        for st in tree.body:
+            visit(st)
+    except LookupError:
+        return None
+    return out
+
+
+def import_loads(n, loads, stores, header_only=False):
+    """Names read while this statement runs at import (function bodies and lambdas excluded)."""
+    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for d in n.decorator_list + n.args.defaults + [k for k in n.args.kw_defaults if k is not None]:
+            import_loads(d, loads, stores)
+        stores.add(n.name)
+        return
+    if isinstance(n, ast.Lambda):
+        for d in n.args.defaults + [k for k in n.args.kw_defaults if k is not None]:
+            import_loads(d, loads, stores)
+        return
+    if isinstance(n, ast.ClassDef):
+        for d in n.decorator_list + n.bases + [k.value for k in n.keywords]:
+            import_loads(d, loads, stores)
+        stores.add(n.name)
+        if not header_only:
+            inner = set()
+            for st in n.body:
+                import_loads(st, loads, inner)
+            stores |= inner
+        return
+    if isinstance(n, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        for g in n.generators:
+            for t in ast.walk(g.target):
+                if isinstance(t, ast.Name):
+                    stores.add(t.id)
+    if isinstance(n, ast.Name):
+        (loads if isinstance(n.ctx, ast.Load) else stores).add(n.id)
+    for ch in ast.iter_child_nodes(n):
+        import_loads(ch, loads, stores)
+
+
 def target_names(node):
     """Names a module- or class-level statement defines or reads."""
     names = set()
@@ -592,6 +658,7 @@ class Selector:
     def __init__(self, m: Map):
         self.m = m
         self.all = set(range(len(m.ids)))
+        self._new_tree, self._defined = None, None
         self._listers = None
 
     def select(self, patch_text: str):
@@ -725,6 +792,7 @@ class Selector:
         except (SyntaxError, ValueError):
             return self.m.file_tests(path), "syntax error"
         Lines.load(hunks, old_text.count("\n") + 1)
+        self._new_tree, self._defined = new_tree, module_names(new_tree)
         changes: list = []
         diff_lists(old_tree.body, new_tree.body, (), old_tree, changes)
         if not changes:
@@ -743,6 +811,8 @@ class Selector:
             return set(), "docstring"
         in_func = any(kind == "func" for kind, _ in c.ctx)
         node = c.node
+        if not in_func and c.part != "insert" and self.undefined_at_import(c):
+            return m.file_tests(path), "name not defined at import"
         if c.part == "new":
             # a statement only in the new file: at class/module level it can define or override names
             if in_func:
@@ -792,9 +862,10 @@ class Selector:
             return body, "def header"
         if isinstance(node, ast.ClassDef):
             inner = self.class_tests(path, c.ctx + (("class", node.name),))
-            return inner | self.scope_tests(
-                path, c.ctx, {node.name}
-            ), "class header" if c.part == "header" else "class changed"
+            if c.part == "header":
+                # bases, keywords and decorators run at import and change every subclass and registry
+                return inner | m.file_tests(path), "class header"
+            return inner | self.scope_tests(path, c.ctx, {node.name}), "class changed"
         if isinstance(node, (ast.Import, ast.ImportFrom)) and not c.ctx:
             return m.file_tests(path), "import changed"
         if c.new is not None and m.known and identifiers(c.new) - m.known:
@@ -827,6 +898,28 @@ class Selector:
                 readers |= m.name_tests(n) or set()
             return readers | self.scope_tests(path, c.ctx, None), "top statement deleted"
         return self.scope_tests(path, c.ctx, names or None), "top statement"
+
+    def undefined_at_import(self, c):
+        """A changed module- or class-level statement that loads, while the module imports, a name the
+        module never defines or imports: importing it raises NameError, so every importer fails."""
+        defined = self._defined
+        if defined is None:
+            return False  # `from x import *`: cannot tell
+        stmt = c.new if c.new is not None else (c.node if c.part == "new" else None)
+        if stmt is None:
+            return False
+        loads, stores = set(), set()
+        import_loads(stmt, loads, stores, header_only=c.part == "header")
+        scope = set(defined) | stores
+        body = self._new_tree.body
+        for kind, name in c.ctx:  # names set earlier in the enclosing class bodies
+            cls = next((n for n in body if isinstance(n, ast.ClassDef) and n.name == name), None)
+            if cls is None:
+                return False
+            for st in cls.body:
+                scope |= target_names(st)
+            body = cls.body
+        return bool(loads - scope)
 
     def class_tests(self, path, ctx):
         qual = ".".join(name for kind, name in ctx if kind == "class")

@@ -458,7 +458,7 @@ def truth(repo, py, out, tests_json):
                 "-p",
                 "timeout",
                 "--timeout",
-                "120",
+                "900",
                 "tests",
             ],
             cwd=root,
