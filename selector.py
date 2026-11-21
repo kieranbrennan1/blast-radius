@@ -868,7 +868,7 @@ class Selector:
                 ), "def changed"
             if c.new is not None and import_time_risk(node, c.new):
                 return body | m.file_tests(path), "def header runs at import"
-            if c.new is not None and is_overload(node) and is_overload(c.new):
+            if c.new is not None and is_overload(node) and is_overload(c.new) and node.name == c.new.name:
                 # a typing.overload stub never runs: the next def of the same name replaces it at import, and
                 # its new defaults/decorators passed import_time_risk above (nothing reads typing's registry)
                 return set(), "overload stub"
@@ -1023,12 +1023,14 @@ def pad(workers, durations, extra):
         return workers
     loads = [sum(durations[t] for t in w) for w in workers]
     top = max(loads)
+    n_top = len(workers[loads.index(top)])
     for t in extra:
         d = durations.get(t)
         if d is None:
             continue
         i = min(range(len(workers)), key=lambda k: loads[k])
-        if loads[i] + d <= top - 10:  # 10 ms margin: durations here are rounded to ms
+        # durations are rounded to ms: allow 0.5 ms of error per test on both workers, plus 1 ms
+        if loads[i] + d + (len(workers[i]) + 1 + n_top) // 2 + 1 <= top:
             workers[i].append(t)
             loads[i] += d
     return workers

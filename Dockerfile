@@ -30,7 +30,7 @@ RUN python /app/pickle_map.py /app/map.json.gz /app/map.pkl && rm /app/map.json.
     && python /app/import_graph.py /app/sqlglot /app/imports.json \
     && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py /app/fastverify.py /app/standins.py /app/standins_tpcds.py /app/standins_tpcds_fp.py \
        /app/sqlglot/sqlglot /app/sqlglot/tests >/dev/null || true \
-    && cd /app/sqlglot && python /app/standins_tpcds_fp.py build /app/tpcds_fp_base.pkl \
+    && (cd /app/sqlglot && python /app/standins_tpcds_fp.py build /app/tpcds_fp_base.pkl || true) \
     && chmod -R a+rX /app /usr/local/lib/python3.13
 
 # a tiny launcher so selector.py itself runs from its compiled .pyc
