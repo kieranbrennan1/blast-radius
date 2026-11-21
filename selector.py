@@ -487,6 +487,15 @@ def simple_value(node):
     )
 
 
+def is_overload(node):
+    """A def decorated with typing.overload (as overload, t.overload or typing.overload)."""
+    for d in getattr(node, "decorator_list", ()):
+        name = d.attr if isinstance(d, ast.Attribute) else d.id if isinstance(d, ast.Name) else None
+        if name == "overload":
+            return True
+    return False
+
+
 def import_time_risk(old, new):
     """Decorators and default values run when the module is imported: a new one there can break every importer."""
     olds = {dump(d) for d in old.decorator_list}
@@ -859,6 +868,10 @@ class Selector:
                 ), "def changed"
             if c.new is not None and import_time_risk(node, c.new):
                 return body | m.file_tests(path), "def header runs at import"
+            if c.new is not None and is_overload(node) and is_overload(c.new):
+                # a typing.overload stub never runs: the next def of the same name replaces it at import, and
+                # its new defaults/decorators passed import_time_risk above (nothing reads typing's registry)
+                return set(), "overload stub"
             return body, "def header"
         if isinstance(node, ast.ClassDef):
             inner = self.class_tests(path, c.ctx + (("class", node.name),))
