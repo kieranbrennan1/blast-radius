@@ -335,7 +335,7 @@ class Verifier:
                     stack.append(y)
         return sources, out
 
-    def run(self, swaps, test_ids, limits, stop_on_fail=True, reload=None):
+    def run(self, swaps, test_ids, limits, stop_on_fail=True, reload=None, fast_exec=False):
         """Fork, apply swaps, run tests in the given order (grouped by class).
 
         Returns {test id: passed?} for every test that finished, or None on trouble.
@@ -343,6 +343,12 @@ class Verifier:
         mods = sorted({tid.split("::")[0][:-3].replace("/", ".") for tid in test_ids})
         if not self.ensure(mods):
             return None
+        rows = None
+        if fast_exec and EXEC_CACHE and "tests.test_executor" in mods:
+            try:
+                rows = _exec_rows()
+            except Exception:  # noqa: BLE001
+                rows = None
         # the test modules' own import may have run the changed functions
         for f, _, own in swaps:
             if own and f.__code__ in STARTED:
@@ -375,6 +381,8 @@ class Verifier:
                     f.__code__ = n
                 if reload is not None:
                     _reload(*reload)
+                if rows is not None:
+                    _fast_exec_setup(rows)
                 signal.signal(signal.SIGALRM, _alarm)
                 _run_child(test_ids, limits, w, stop_on_fail)
                 os.write(w, b"#done\n")
@@ -478,6 +486,103 @@ class _Rec(unittest.TestResult):
 
 class _Abort(BaseException):
     pass
+
+
+# TestExecutor.setUpClass turns ~1M CSV values into Python rows (~2 s CPU), and it ran again in every child that ran an
+# executor test. The rows come only from fixture files and plain Python (csv, ast), never from sqlglot, so the server
+# reads them once and each child builds the same tables from them. sqlglot's Table, duckdb and the SQL fixtures are
+# still made in the child, on the patched code. Used only when the commit touches no test file. BR_EXEC_CACHE=0: off.
+EXEC_CACHE = os.environ.get("BR_EXEC_CACHE", "1") == "1"
+_EXEC_ROWS = None
+
+
+def _exec_rows():
+    """Server side, once: {csv file: rows} exactly as TestExecutor.setUpClass builds them."""
+    global _EXEC_ROWS
+    if _EXEC_ROWS is None:
+        import ast
+        import csv
+
+        m = sys.modules["tests.test_executor"]
+        out = {}
+        for directory, schema in ((m.DIR_TPCH, m.TPCH_SCHEMA), (m.DIR_TPCDS, m.TPCDS_SCHEMA)):
+            for table in schema:
+                file_name = f"{directory}{table}.csv.gz"
+                with m.open_file(file_name) as fh:
+                    reader = csv.reader(fh, delimiter="|")
+                    rows = []
+                    ctypes = []
+                    next(reader)
+                    for row in reader:
+                        if not ctypes:
+                            for v in row:
+                                try:
+                                    ctypes.append(type(ast.literal_eval(v)))
+                                except (ValueError, SyntaxError):
+                                    ctypes.append(str)
+                        rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+                out[file_name] = rows
+        _EXEC_ROWS = out
+    return _EXEC_ROWS
+
+
+class _LazyConn:
+    """A duckdb connection made (with its views) the first time a test uses it."""
+
+    def __init__(self, make):
+        self._make = make
+        self._conn = None
+
+    def close(self):
+        if self._conn is not None:
+            self._conn.close()
+
+    def __getattr__(self, name):
+        if self._conn is None:
+            self._conn = self._make()
+        return getattr(self._conn, name)
+
+
+def _fast_exec_setup(rows):
+    """Child side: TestExecutor.setUpClass as written in the pinned tests, with the rows read from the cache."""
+    m = sys.modules.get("tests.test_executor")
+    cls = getattr(m, "TestExecutor", None)
+    if cls is None:
+        return
+
+    def views(directory, schema):
+        def make():
+            conn = m.duckdb.connect()
+            for table, columns in schema.items():
+                file_name = f"{directory}{table}.csv.gz"
+                conn.execute(
+                    f"""
+                CREATE VIEW {table} AS
+                SELECT *
+                FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
+                """
+                )
+            return conn
+
+        return _LazyConn(make)
+
+    def setUpClass(cls):
+        # duckdb's views cost ~0.9 s and only the TPC comparisons query them: made on first use
+        cls.tpch_conn = views(m.DIR_TPCH, m.TPCH_SCHEMA)
+        cls.tpcds_conn = views(m.DIR_TPCDS, m.TPCDS_SCHEMA)
+        cls.tpch_tables = {}
+        cls.tpcds_tables = {}
+        for directory, schema, tables in (
+            (m.DIR_TPCH, m.TPCH_SCHEMA, cls.tpch_tables),
+            (m.DIR_TPCDS, m.TPCDS_SCHEMA, cls.tpcds_tables),
+        ):
+            for table, columns in schema.items():
+                tables[table] = m.Table(columns=columns, rows=rows[f"{directory}{table}.csv.gz"])
+        cls.cache = {}
+        cls.tpch_sqls = list(m.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+        cls.tpcds_sqls = list(m.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+
+    cls.setUpClass = classmethod(setUpClass)
 
 
 def _run_child(test_ids, limits, w, stop_on_fail):
@@ -599,7 +704,8 @@ def _check(v, req):
             reload = None
         else:
             v.ensure([])
-    res = v.run(swaps, req["ids"], req["limits"], stop_on_fail=req["stop_on_fail"], reload=reload)
+    fast_exec = not any(p.startswith("tests/") for p in files)
+    res = v.run(swaps, req["ids"], req["limits"], stop_on_fail=req["stop_on_fail"], reload=reload, fast_exec=fast_exec)
     how = f"reload {len(reload[1])}" if reload else f"swap {len(swaps)}"
     return {"how": how, "res": res}
 

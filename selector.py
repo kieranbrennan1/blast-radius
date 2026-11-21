@@ -1058,6 +1058,10 @@ HEAVY_MODULES = {"tests.test_optimizer", "tests.test_executor"}
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 SLOW_SETUP = "tests/test_executor.py::TestExecutor::"
 SLOW_SETUP_MS = 2200
+SLOW_SETUP_CACHED_MS = 200  # duckdb views + sqlglot Table + SQL fixtures, rows from the cache
+# Off: the board showed the fakes mislead on changes that alter which tests are checked (28beab2), so the cache only
+# lowers CPU and every choice stays as in c174142. BR_SETUP_ONCE=1 also prices the cached set-up (fakes: a tie).
+SETUP_ONCE = os.environ.get("BR_SETUP_ONCE", "0") == "1" and os.environ.get("BR_EXEC_CACHE", "1") == "1"
 AFTER_FAIL_MIN_MS = float(os.environ.get("BR_AFTER_FAIL_MIN_MS", "1e9"))  # failing tests run slowly: stop at the first  # TestExecutor.setUpClass, paid in every child that runs one
 
 # The slowest tests are never run as they are (a run costs as much CPU as it saves). A stand-in runs the
@@ -1186,6 +1190,7 @@ class Checker:
         self.starts = 0
         self.no_heavy = False
         self.heavy_paid = False
+        self.setup_paid = False
         self.tpcds = None
         self.tpcds_fp = None
         self.number_of = {v: k for k, v in ids_by_number.items()}
@@ -1300,7 +1305,9 @@ class Checker:
                 gain = pack_cost(numbers, d) - pack_cost(keep, d)
                 est = 60 + RUN_RATIO * sum(d[t] for t in cand) + 5 * reload_n + sum(s[2] for s in use)
                 if any(self.ids[t].startswith(SLOW_SETUP) for t in cand):
-                    est += SLOW_SETUP_MS
+                    # the checker reads the executor's tables once and reuses them (fastverify._exec_rows)
+                    cached = SETUP_ONCE and self.setup_paid and not any(p.startswith("tests/") for p in files)
+                    est += SLOW_SETUP_CACHED_MS if cached else SLOW_SETUP_MS
                 heavy = any(self.ids[t].startswith(HEAVY_FILES) for t in cand) or any(s[3] for s in use)
                 if not self.heavy_paid and heavy:
                     est += HEAVY_IMPORT_MS
@@ -1314,6 +1321,8 @@ class Checker:
             return None
         if any(self.ids[t].startswith(HEAVY_FILES) for t in best[4]) or any(s[3] for s in best[6]):
             self.heavy_paid = True
+        if any(self.ids[t].startswith(SLOW_SETUP) for t in best[4]) and not any(p.startswith("tests/") for p in files):
+            self.setup_paid = True
         return best
 
     def server(self):

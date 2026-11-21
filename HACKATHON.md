@@ -158,3 +158,9 @@ Next lever (not built): import-state fingerprint for module-level / class-header
   m01060. Built instead: edits inside a `typing.overload` stub select nothing (same name required; stubs never run).
   Arm64, checks on: 134 fakes **1037.9 s** (main 1065.3), 0 misses, CPU 39.4 vs 38.8; sample 106.1 = 106.1.
   Bigger version (dict-key-level read map, wins m01058/m03023 ~+54 s on the fakes) needs a full re-trace of 1,620 tests.
+
+## Rule after 28beab2 (2026-11-20 23:55, lesson L82)
+- Sort every change before shipping. **Pure win** (same tests chosen and checked, only less CPU or fewer seconds): fine
+  on the fakes' word. **Trade** (changes which tests are run or checked): the fakes can't judge it, since only 24 of ~190
+  touch optimizer/executor code; it needs board-like evidence or the board. 28beab2 was a trade judged on the fakes.
+- exec-cache (19c8105) is a pure win: TestExecutor's TPC rows parsed once in the checker, duckdb views on first use.
