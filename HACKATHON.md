@@ -86,7 +86,7 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
 
 ## What the problem really is (research 2026-11-20, brain: insights/blast-radius-problem-deep-dive)
 Read before any new build step. Full notes: ~/brain/raw/sources/2026-11-20-blast-radius-problem-notes/.
-- The commits are one-line fake bugs (mutants) from a generator: the job is "which tests kill this mutant".
+- The commits are mostly one-line fake bugs (mutants) from a generator (sample: 3 comment-only, 3 multi-file): the job is "which tests kill this mutant".
   The final is ~60 unseen commits (1.5× the 40 practice) with mutation kinds not seen in practice.
   Likely new kinds (from the top team's own harness): deleted/reordered statements, changed defaults, removed dict
   entries, renamed module functions, syntax errors, decorator removal, package __init__ edits, edits to test files
@@ -100,7 +100,9 @@ Read before any new build step. Full notes: ~/brain/raw/sources/2026-11-20-blast
   So: no risk-taking drops (JstD-style), explainable rules, README showing every map comes from eb11aec.
 - The gap to first (197.0 vs 153.7) is mostly test time on the hidden commits, not CPU: our simulated 176.4 s alone
   is worse than the leader's whole 153.7 s. Rough split (if their CPU ≈ 9 s): ~31 s tests, ~12 s CPU (20.6 s ours).
-  Both come from keeping the big tests (28.8 / 21.5 / 6.7 s) when nothing breaks. Biggest known lever: replay the TPC-H/TPC-DS
+  On the 30 sample commits we beat the leader's own claim (~106 s vs ~132 s of tests), so we lose on the hidden commits.
+  Likely causes (guesses, not measured): the big tests (28.8 max_nodes / 21.5 tpcds / 6.7 s) kept when nothing breaks,
+  and unfamiliar edits falling back to all tests. Biggest known lever: replay the TPC-H/TPC-DS
   executor tests from build-time recordings (likely #1 team's brreplay.py, ~10 other entries do partial
   replay); any query not recorded → run it / send the test to CI.
 - Production systems all keep a "run everything" list for global files plus a full-run safety net; ours is the
