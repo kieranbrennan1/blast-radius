@@ -1,40 +1,64 @@
-# Builders Buildathon · RWX Blast Radius — ends 2026-11-22 11:00 ET
+# Builders Buildathon · RWX Blast Radius — ends Sun 2026-11-22 11:00 ET
 
-## Rules
-- Machine-scored, no pitch. AI allowed. Solo or 2 people. MIT license. Name outside code in README.
-- Hand in: public GitHub repo, Dockerfile at top, + commit hash. 1 submission an hour.
+## The problem in one breath
+Each commit is one patch to sqlglot @ eb11aec. Print, per commit, which of the 1620 tests to run, split over ≤ 8
+workers. Pay: busiest worker's recorded seconds + 2 s per worker + 300 s if any failing test is left out, plus the
+CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final counts.
+
+## Rules that shape strategy
+- Machine-scored, no pitch. AI allowed. Public repo, Dockerfile at top, + commit hash. 1 submission an hour.
 - Build: network, 4 cores, 8 GB, 10 min. Only PyPI / Docker Hub / GitHub releases at a tag / sqlglot @ eb11aec.
-- Run: no network, 2 cores, 4 GB, 3 min for ~30 commits (4.5 min, ~45 commits in the final), read-only disk,
-  64 MB /tmp, user nobody. Repo ≤ 20 MB.
-- No lookup table from patch (or kind of edit) to failing tests. Maps from the pinned commit are fine.
+- Run: no network, 2 cores, 4 GB, 3 min (~30 commits); final 4.5 min (~45 commits). Read-only disk, 64 MB /tmp,
+  user nobody, ≤ 256 processes, stdout ≤ 2 MB. Repo ≤ 20 MB.
+- No lookup table from a patch or kind of edit to failing tests. Maps from the pinned commit are fine. Top entries are read.
+- **Final**: our chosen commit (best practice score unless we pick another) runs on unseen commits, *including kinds of
+  change not in practice*. Top 5 are re-run 5 times, one at a time on an idle machine; that middle replaces the score.
+- **Ties**: within 1 s of the best counts as a tie, earliest submission wins. Repo must stay public with every
+  submitted commit until results.
 
-## Judged on
-Simulated CI seconds, lower wins: busiest worker's test seconds + 2 s per worker + 300 s per missed commit
-+ our CPU seconds. Middle of 3 runs. Final: unseen commits incl. new kinds of change. Within 1 s of best = tie,
-earliest submission wins.
+## The score math (what each lever is worth)
+- One miss = +300 s. Our whole practice score is 197 s, so **one miss in the final loses**. Dropping a test is only
+  worth it if its chance of hiding a failure is under (seconds saved ÷ 300): saving 2 s needs < 0.7 % risk.
+- Worker fee: proving "nothing fails" on a commit saves at least 2 s; that is most of what the run-time check buys.
+- Packing: a commit that must run a big test (tpcds 21.5 s, max_nodes 28.8 s) can carry ~20 s of other tests on a
+  second worker for +2 s. Checking small tests there is wasted CPU (`pack_cost` already sees this).
+- CPU: every second our program runs is charged 1:1. Running a test costs ~its recorded time in CPU; it only pays
+  when it removes a worker or lowers the busiest one by more.
 
-## The plan
-1. Coverage map from the pinned commit: which tests run which lines (function-level + import-time), which
-   fixture files (and lines) each test reads.
-2. Selector: patch → changed lines → candidate tests. Nothing touched → run nothing.
-3. Verify at run time: copy sqlglot to /tmp, apply the patch, run the cheap candidates in-process, keep only
-   the ones that really fail. Big tests (max_nodes 28.8 s, tpcds 21.5 s) are included, not run, when candidates.
-4. Split into the cheapest number of workers.
+## Where we stand (2026-11-20 22:17)
+| Version | Practice board | Simulated | CPU | Misses |
+|---|---|---|---|---|
+| e13232b (map + syntax-tree diff) | 223.9 s | 223.4 | 0.5 | 0 |
+| 312e093 (+ run-time check) — current best, goes to final | **197.0 s** | 176.4 | **20.6** | 0 |
+| Board best (~22:00) | 153.7 s | ? | ? | ? |
 
-## Numbers
-- Sample: 30 commits, 1620 tests, 103 s for the whole suite, 12 commits break nothing.
-- Perfect answers on the sample would score ~107 s + CPU. Board best 197.2 s, starter 1614.1 s.
+- Sample (30 commits, answers known): perfect 94.4 s, ours 106.4 s, 0 misses. Only 4d63 (+9.1 s, string-keyed
+  tokenizer table) and 5y72 (+2.5 s) are real gaps. **The sample is nearly solved; it no longer tells us where we lose.**
+- Practice is hidden: we see only the totals. It is "heavier" than the sample for us (223 vs 115 simulated before the check).
+- Two of 30 sample commits fail test_execute_tpcds: ~51 s of the 94 s floor is big tests that really fail.
+
+## What we don't know yet (the blind spots)
+1. **Server CPU is 8× what we measure.** Local Docker (Rosetta) shows ~2.6 s CPU because duckdb crashes there, so
+   optimizer/executor tests are never checked locally. On the amd64 server they load and get run: 20.6 s. We don't
+   know which part of that 20.6 s bought simulated savings and which was waste.
+2. Where the 43 s gap to 153.7 sits on practice: over-selection, CPU, or both.
+3. What "new kinds of change" the final adds, and whether every rule falls back safely on them.
 
 ## Slices
-1. [x] Docker (Colima) + Python 3.13 env, `make sample` runs the starter → 1210 s simulated locally
-2. [~] Coverage map: v1 done (missed pool-worker processes); v2 re-trace follows child processes + run-time-only lines
-3. [~] Selector v1: syntax-tree diff, lambda-aware, import-breaking names → check: 0 misses on sample + mutants
-4. [ ] Run-time verify → check: 0 misses, lower score
-5. [ ] Push public repo + submit (needs Kieran: team + yes to publish)
+1. [x] Docker (Colima) + env, starter runs (1210 s)
+2. [x] Coverage map v2 (follows pool workers), reads map
+3. [x] Selector: syntax-tree diff, import-breaking names, class/table rules, safety net
+4. [x] Run-time check (`fastverify.py`) → 0 misses on 75 answered fakes + sample
+5. [x] Submitted e13232b (223.9), 312e093 (197.0)
+6. [ ] Measure checker CPU with duckdb working (native arm64 image, or a heavy-off A/B submission)
+7. [ ] Cut wasted CPU / tune when to check, then resubmit
+8. [ ] Final-robustness pass on new kinds of change; pick the final commit deliberately
 
 ## Dead ends
 - Re-running the whole module tree dump per commit cost ~2 s CPU: now only statements near the edit are dumped.
-- Run-time verify (fork server): right answers, but ~1 s overhead per commit vs ~2 s saved; parked until measured idle.
+- Tracer as a pytest plugin only: missed pool-worker processes (3 sample misses).
+- `x is True` → `x == True` as a no-op: wrong (1 == True).
 
 ## Rules from Kieran
-- Ask before creating the team, making the repo public or submitting (2026-11-20).
+- Ask before creating the team, making the repo public or submitting (2026-11-20). Later: "Yes, resubmit freely"
+  for versions that test better; pushing still asked each time.
