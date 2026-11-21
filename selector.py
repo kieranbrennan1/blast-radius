@@ -913,7 +913,7 @@ class Selector:
             return self.m.file_tests(path), "syntax error"
         Lines.load(hunks, old_text.count("\n") + 1)
         self._new_tree, self._defined = new_tree, module_names(new_tree)
-        self._old_tree = old_tree
+        self._old_tree, self._new_text = old_tree, new_text
         changes: list = []
         diff_lists(old_tree.body, new_tree.body, (), old_tree, changes)
         if not changes:
@@ -952,6 +952,16 @@ class Selector:
                 # a new method is found through dir()/getattr (e.g. the generator's *_sql dispatch), not by name
                 return self.class_tests(path, c.ctx), "new method"
             names = target_names(node)
+            if (
+                names
+                and c.ctx
+                and c.ctx[-1][0] == "class"
+                and self.plain_class_constant(path, c, node, names)
+                and all(self.read_only_by_unrelated(path, c, n) for n in names)
+            ):
+                # every read of the name is `self.NAME` in a method of a class that no object of the edited
+                # class can be: nothing can see the new attribute
+                return set(), "new class constant read only by unrelated classes"
             return self.scope_tests(path, c.ctx, names or None), "new top statement"
         if c.part == "insert":
             prev, nxt = c.neighbors
@@ -1308,6 +1318,190 @@ class Selector:
                     else:
                         return False
                     if not ok_class(mod, k):
+                        return False
+        return True
+
+    def read_only_by_unrelated(self, path, c, name):
+        """For a class constant newly added to class C: True when every mention of `name` in sqlglot/ and
+        tests/ (the edited file as patched) is either a store directly in some class body or a load
+        `self.name` / `cls.name` directly inside a method F of a class K that no object of C can be:
+        K is not C, not above or below it, no class (sqlglot or tests, by bare name, over-counted) is below
+        both, and nothing in K's family is a metaclass (`type`, `*Meta*`, or named in `metaclass=`).
+        F has no decorator but classmethod/property, its receiver is its first parameter and is never
+        rebound, and F itself is reached only as `self.F` / `cls.F` / `super().F` and never named in a
+        string (so it is never called with a foreign receiver). Any other mention (a string, docstring,
+        comment, import, keyword, attribute store such as a test's monkeypatch) says no. Only for a patch
+        whose one Python file is this one."""
+        import re
+
+        if getattr(self, "_py_paths", None) != {path}:
+            return False
+        me = [nm for kind, nm in c.ctx if kind == "class"][-1]
+        if getattr(self, "_all_bases_idx", None) is None:
+            pat = re.compile(r"^[ \t]*class[ \t]+(\w+)[ \t]*(?:\(([^)]*)\))?[ \t]*:", re.M)
+            metas = re.compile(r"metaclass[ \t]*=[ \t]*([\w.]+)")
+            bases, meta_names, files = {}, set(), []
+            for top in ("sqlglot", "tests"):
+                for p in sorted((REPO / top).rglob("*.py")):
+                    rel = p.relative_to(REPO).as_posix()
+                    try:
+                        text = p.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        self._all_bases_idx = False
+                        return False
+                    files.append((rel, text))
+                    meta_names.update(x.split(".")[-1] for x in metas.findall(text))
+                    for k, args in pat.findall(text):
+                        got = bases.setdefault(k, [])
+                        for a in args.split(","):
+                            a = a.strip()
+                            if a and "=" not in a and not a.startswith("*"):
+                                got.append(a.split("[")[0].split(".")[-1].strip())
+            self._all_bases_idx = (bases, meta_names, files)
+        if not self._all_bases_idx:
+            return False
+        bases, meta_names, files = self._all_bases_idx
+
+        def up(k):
+            out, todo = set(), [k]
+            while todo:
+                b = todo.pop()
+                if b not in out:
+                    out.add(b)
+                    todo.extend(bases.get(b, ()))
+            return out
+
+        def down(k):
+            out, todo = set(), [k]
+            while todo:
+                b = todo.pop()
+                if b not in out:
+                    out.add(b)
+                    todo.extend(x for x, bs in bases.items() if b in bs)
+            return out
+
+        def forwarders():
+            """Names of classes (sqlglot and tests) that define __getattr__ or __getattribute__."""
+            if getattr(self, "_forwarders", None) is None:
+                got = set()
+                for _rel, text in files:
+                    if "__getattr__" not in text and "__getattribute__" not in text:
+                        continue
+                    try:
+                        t = ast.parse(text)
+                    except (SyntaxError, ValueError):
+                        got.add("*")
+                        continue
+                    hooks = {"__getattr__", "__getattribute__"}
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.ClassDef):
+                            for s in n.body:
+                                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name in hooks:
+                                    got.add(n.name)
+                                elif isinstance(s, (ast.Assign, ast.AnnAssign)) and target_names(s) & hooks:
+                                    got.add(n.name)
+                if "*" in got:
+                    got |= set(bases)  # a file we cannot read: count every class as forwarding
+                self._forwarders = got
+            return self._forwarders
+
+        mine_up, mine_down = up(me), down(me)
+        word = re.compile(r"\b" + re.escape(name) + r"\b")
+        methods = set()  # names of the methods whose receiver reads the name
+        for rel, text in files:
+            if rel == path:
+                text = self._new_text
+            hits = len(word.findall(text))
+            if not hits:
+                continue
+            try:
+                tree = self._new_tree if rel == path else ast.parse(text)
+            except (SyntaxError, ValueError):
+                return False
+            parents = {}
+            for n in ast.walk(tree):
+                for ch in ast.iter_child_nodes(n):
+                    parents[ch] = n
+            seen = 0
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Name) and n.id == name:
+                    seen += 1
+                    p = parents.get(n)
+                    tgt_ok = isinstance(n.ctx, ast.Store) and (
+                        (isinstance(p, ast.Assign) and n in p.targets) or (isinstance(p, ast.AnnAssign) and p.target is n)
+                    )
+                    if not (tgt_ok and isinstance(parents.get(p), ast.ClassDef)):
+                        return False
+                elif isinstance(n, ast.Attribute) and n.attr == name:
+                    seen += 1
+                    v = n.value
+                    if not (isinstance(n.ctx, ast.Load) and isinstance(v, ast.Name) and v.id in ("self", "cls")):
+                        return False
+                    f = parents.get(n)
+                    while f is not None and not isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                        f = parents.get(f)
+                    if not isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        return False
+                    k = parents.get(f)
+                    if not isinstance(k, ast.ClassDef):
+                        return False
+                    if {ast.unparse(d) for d in f.decorator_list} - {"classmethod", "property"}:
+                        return False
+                    params = f.args.posonlyargs + f.args.args
+                    if not params or params[0].arg != v.id:
+                        return False
+                    for x in ast.walk(f):
+                        if isinstance(x, ast.Name) and x.id == v.id and not isinstance(x.ctx, ast.Load):
+                            return False
+                        if isinstance(x, (ast.Nonlocal, ast.Global)) and v.id in x.names:
+                            return False
+                        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and x is not f:
+                            a = x.args
+                            if any(y.arg == v.id for y in a.posonlyargs + a.args + a.kwonlyargs):
+                                return False
+                    fam = up(k.name) | down(k.name)
+                    if k.name in mine_up | mine_down or down(k.name) & mine_down:
+                        return False
+                    if fam & meta_names or any(b == "type" or "meta" in b.lower() for b in fam):
+                        return False
+                    if up(k.name) & forwarders():
+                        return False  # a missing attribute is handed to __getattr__, which may ask a C object
+                    methods.add(f.name)
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+                    return False
+                elif isinstance(n, ast.arg) and n.arg == name:
+                    return False
+                elif isinstance(n, ast.keyword) and n.arg == name:
+                    return False
+                elif isinstance(n, ast.alias) and name in (n.name.split(".")[-1], n.asname):
+                    return False
+            if seen != hits:
+                return False  # a string, docstring, comment or import names it
+        # each such method must be reached only through its own receiver (never called on a foreign object)
+        for meth in methods:
+            if meth.startswith("__") and meth.endswith("__") and meth != "__init__":
+                return False
+            mword = re.compile(r"\b" + re.escape(meth) + r"\b")
+            for rel, text in files:
+                if rel == path:
+                    text = self._new_text
+                if not mword.search(text):
+                    continue
+                if f'"{meth}"' in text or f"'{meth}'" in text:
+                    return False
+                try:
+                    tree = self._new_tree if rel == path else ast.parse(text)
+                except (SyntaxError, ValueError):
+                    return False
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Attribute) and n.attr == meth:
+                        v = n.value
+                        if isinstance(v, ast.Name) and v.id in ("self", "cls"):
+                            continue
+                        if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "super":
+                            continue
+                        return False
+                    if isinstance(n, ast.Name) and n.id == meth:
                         return False
         return True
 
