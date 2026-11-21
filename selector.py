@@ -16,6 +16,7 @@ Then the chosen tests are packed onto the number of workers (1-8) that costs lea
 """
 
 import ast
+import copy
 import difflib
 import json
 import os
@@ -496,6 +497,45 @@ def is_overload(node):
     return False
 
 
+def _overload_only(decs):
+    return all((d.attr if isinstance(d, ast.Attribute) else d.id if isinstance(d, ast.Name) else None) == "overload"
+               for d in decs)
+
+
+def _shadowed_later(tree, node):
+    """node sits in a body where the next statements are only defs of its name, the last without @overload:
+    that def replaces node's name before anything can read it."""
+    for parent in ast.walk(tree):
+        for f in COMPOUND_BODIES:
+            body = getattr(parent, f, None)
+            if isinstance(body, list) and any(s is node for s in body):
+                i = next(k for k, s in enumerate(body) if s is node)
+                for s in body[i + 1:]:
+                    if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) or s.name != node.name:
+                        return False
+                    if not s.decorator_list:
+                        return True
+                    if not _overload_only(s.decorator_list):
+                        return False
+                return False
+    return False
+
+
+def overload_toggle(old_tree, new_tree, old, new):
+    """Only a bare @overload added to or removed from a stub that a later plain def of the same name replaces
+    (in the old and the new file): typing.overload just returns a dummy, and nothing in sqlglot or its tests
+    reads typing's overload registry (no get_overloads), so no test can see the difference."""
+    if type(old) is not type(new) or not isinstance(old, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    if old.name != new.name or not (_overload_only(old.decorator_list) and _overload_only(new.decorator_list)):
+        return False
+    a, b = copy.copy(old), copy.copy(new)
+    a.decorator_list, b.decorator_list = [], []
+    if dump(a) != dump(b):
+        return False
+    return _shadowed_later(old_tree, old) and _shadowed_later(new_tree, new)
+
+
 def import_time_risk(old, new):
     """Decorators and default values run when the module is imported: a new one there can break every importer."""
     olds = {dump(d) for d in old.decorator_list}
@@ -802,6 +842,7 @@ class Selector:
             return self.m.file_tests(path), "syntax error"
         Lines.load(hunks, old_text.count("\n") + 1)
         self._new_tree, self._defined = new_tree, module_names(new_tree)
+        self._old_tree = old_tree
         changes: list = []
         diff_lists(old_tree.body, new_tree.body, (), old_tree, changes)
         if not changes:
@@ -857,6 +898,8 @@ class Selector:
             return set(), "insert at top"
         if c.new is not None and not header_spots(node, c.new, c.part):
             return set(), "equivalent edit"
+        if c.part == "header" and c.new is not None and overload_toggle(self._old_tree, self._new_tree, node, c.new):
+            return set(), "overload stub"
         if in_func:
             return m.line_tests(path, *node_span(node, c.part)), "function line"
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
