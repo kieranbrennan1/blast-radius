@@ -986,7 +986,9 @@ HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 SLOW_SETUP = "tests/test_executor.py::TestExecutor::"
 SLOW_SETUP_MS = 2200
 SLOW_SETUP_CACHED_MS = 200  # duckdb views + sqlglot Table + SQL fixtures, rows from the cache
-SETUP_ONCE = os.environ.get("BR_SETUP_ONCE", "1") == "1" and os.environ.get("BR_EXEC_CACHE", "1") == "1"
+# Off: the board showed the fakes mislead on changes that alter which tests are checked (28beab2), so the cache only
+# lowers CPU and every choice stays as in c174142. BR_SETUP_ONCE=1 also prices the cached set-up (fakes: a tie).
+SETUP_ONCE = os.environ.get("BR_SETUP_ONCE", "0") == "1" and os.environ.get("BR_EXEC_CACHE", "1") == "1"
 AFTER_FAIL_MIN_MS = float(os.environ.get("BR_AFTER_FAIL_MIN_MS", "1e9"))  # failing tests run slowly: stop at the first  # TestExecutor.setUpClass, paid in every child that runs one
 
 # The slowest tests are never run as they are (a run costs as much CPU as it saves). A stand-in runs the
