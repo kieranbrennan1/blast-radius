@@ -106,6 +106,19 @@ class Map:
     def name_tests(self, name: str):
         return self._get(self.names, name)
 
+    def exp_users(self, name: str) -> set:
+        """Tests that built an expression of class `name` (any sqlglot.expressions module)."""
+        if not hasattr(self, "_exp_index"):
+            self._exp_index = {}
+            for key, i in self.classes.items():
+                mod, qual = key.split(":", 1)
+                if mod.startswith("sqlglot.expressions"):
+                    self._exp_index.setdefault(qual, []).append(i)
+        out = set()
+        for i in self._exp_index.get(name, ()):
+            out |= self.s(i)
+        return out
+
     def reader_tests(self, name: str):
         """Tests that read the name. If nothing reads it while a module or class body runs,
         only function code can see a change, so count run-time reads only."""
@@ -476,6 +489,39 @@ def defined_names(body):
     return out
 
 
+def exp_class(node):
+    """'IntDiv' for `exp.IntDiv`, else None."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "exp" and node.attr[:1].isupper():
+        return node.attr
+    return None
+
+
+def entry_classes(stmt, spots):
+    """If every changed spot sits in a dict entry or set/list element keyed by an `exp.X` class, return
+    those class names; such an entry is only looked at when an X expression is handled."""
+    parents = {}
+    for node in ast.walk(stmt):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    found = set()
+    for spot in spots:
+        hit = exp_class(spot) if isinstance(parents.get(spot), (ast.Dict, ast.Set, ast.List, ast.Tuple)) else None
+        node = spot
+        while not hit and node in parents:
+            parent = parents[node]
+            if isinstance(parent, ast.Dict):
+                for k, v in zip(parent.keys, parent.values):
+                    if node is k or node is v:
+                        hit = exp_class(k)
+            elif isinstance(parent, (ast.Set, ast.List, ast.Tuple)):
+                hit = exp_class(node)
+            node = parent
+        if not hit:
+            return None
+        found.add(hit)
+    return found
+
+
 def module_name(path: str) -> str:
     mod = path[:-3].replace("/", ".")
     return mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
@@ -632,13 +678,26 @@ class Selector:
             return m.file_tests(path), "import changed"
         if c.new is not None and m.known and identifiers(c.new) - m.known:
             return m.file_tests(path), "unknown name at import time"
-        if c.new is not None and m.rlines is not None:
-            spots = diff_spots(node, c.new)
-            if spots and all(isinstance(sp, ast.Lambda) for sp in spots):
-                got = set()
-                for sp in spots:
-                    got |= m.line_tests(path, sp.lineno, sp.end_lineno, runtime=True)
-                return got, "lambda"
+        if c.new is not None:
+            # each rule below gives a safe superset; keep what all of them agree on
+            got, whys = self.scope_tests(path, c.ctx, target_names(node) or None), ["top statement"]
+            olds = diff_spots(node, c.new)
+            news = diff_spots(c.new, node)
+            keys_old = entry_classes(node, olds) if olds else None
+            keys_new = entry_classes(c.new, news) if news else None
+            if keys_old is not None and keys_new is not None:
+                users = set()
+                for name in keys_old | keys_new:
+                    users |= m.exp_users(name)
+                got &= users
+                whys.append("table entry " + ",".join(sorted(keys_old | keys_new)))
+            if m.rlines is not None and olds and all(isinstance(sp, ast.Lambda) for sp in olds):
+                lam = set()
+                for sp in olds:
+                    lam |= m.line_tests(path, sp.lineno, sp.end_lineno, runtime=True)
+                got &= lam
+                whys.append("lambda")
+            return got, "+".join(whys)
         names = target_names(node)
         if c.new is None and names:
             # deleted: anything that reads the name may now crash, even at import

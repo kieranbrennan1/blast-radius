@@ -198,6 +198,52 @@ def mutate_string(rng, repo):
     return None
 
 
+def mutate_table(rng, repo):
+    """Change one `exp.X: value,` entry in a class-level table (rename target or swap the value)."""
+    files = [f for f in py_files(repo, "sqlglot") if "/generators/" in f or "/parsers/" in f or "/typing/" in f or f.endswith(("generator.py", "parser.py"))]
+    for _ in range(200):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        cands = [i for i, ln in enumerate(lines) if re.match(r"^ {4,8}exp\.\w+: .+,$", ln)]
+        if len(cands) < 2:
+            continue
+        idx = rng.choice(cands)
+        line = lines[idx]
+        m = re.search(r'"([A-Za-z_]{3,})"', line)
+        if m and rng.random() < 0.6:
+            new = line[: m.start(1)] + m.group(1)[:-1] + line[m.end(1):]
+        else:
+            other = lines[rng.choice(cands)]
+            key = line.split(":", 1)[0]
+            new = key + ":" + other.split(":", 1)[1]
+        if new == line:
+            continue
+        new_text = "\n".join(lines[:idx] + [new] + lines[idx + 1:])
+        try:
+            compile(new_text, path, "exec")
+        except SyntaxError:
+            continue
+        return path, "\n".join(lines), new_text
+    return None
+
+
+def mutate_equiv(rng, repo):
+    """`x is None` -> `x == None` style swaps (should break nothing)."""
+    files = py_files(repo, "sqlglot")
+    for _ in range(300):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        cands = [i for i, ln in enumerate(lines) if re.search(r" is (not )?(None|[A-Z][A-Za-z]+\.[A-Z_]{2,})\b", ln) and not ln.strip().startswith("#")]
+        if not cands:
+            continue
+        idx = rng.choice(cands)
+        new = re.sub(r" is not (None|[A-Z][A-Za-z]+\.[A-Z_]{2,})\b", r" != \1", lines[idx], count=1)
+        if new == lines[idx]:
+            new = re.sub(r" is (None|[A-Z][A-Za-z]+\.[A-Z_]{2,})\b", r" == \1", lines[idx], count=1)
+        return path, "\n".join(lines), "\n".join(lines[:idx] + [new] + lines[idx + 1:])
+    return None
+
+
 KINDS = {
     "code": (mutate_code, 6),
     "class": (lambda r, repo: mutate_code(r, repo, class_level=True), 3),
@@ -206,13 +252,19 @@ KINDS = {
     "delete": (mutate_delete, 2),
     "test": (mutate_test, 1),
     "string": (mutate_string, 2),
+    "table": (mutate_table, 0),
+    "equiv": (mutate_equiv, 0),
 }
 
 
 def make(repo, out, count, seed):
     rng = random.Random(seed)
     os.makedirs(os.path.join(out, "commits"), exist_ok=True)
-    kinds = [k for k, (_, w) in KINDS.items() for _ in range(w)]
+    only = os.environ.get("MUT_KINDS")
+    if only:
+        kinds = only.split(",")
+    else:
+        kinds = [k for k, (_, w) in KINDS.items() for _ in range(w)]
     meta = {}
     made = 0
     while made < count:
