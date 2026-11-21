@@ -1027,7 +1027,9 @@ class Checker:
     def candidates(self, numbers, limit=None):
         d = self.durations
         limit = limit or VERIFY_MAX_MS
-        skip = ("tests/test_optimizer.py", "tests/test_executor.py") if os.environ.get("BR_SKIP_HEAVY") else ("\0",)
+        # optimizer/executor tests are kept, not checked: measured with duckdb loaded, checking them cost ~2x the
+        # seconds it saved (102 fakes: 61 s CPU for 28 s). BR_SKIP_HEAVY=0 turns them back on.
+        skip = ("tests/test_optimizer.py", "tests/test_executor.py") if os.environ.get("BR_SKIP_HEAVY", "1") == "1" else ("\0",)
         return [
             t
             for t in numbers
