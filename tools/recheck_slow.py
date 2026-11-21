@@ -17,14 +17,23 @@ for cid in cids:
     shutil.copytree(os.path.join(here, "work", "sqlglot"), root, ignore=shutil.ignore_patterns(".git"))
     for f in selector.parse_patch(open(os.path.join(out, "commits", cid + ".patch")).read()):
         p = os.path.join(root, f["old"] or f["new"])
-        open(p, "w").write(selector.apply_hunks(open(p).read(), f["hunks"]))
+        old = open(p).read()  # read first: open(p, "w") empties the file
+        assert selector.hunks_match(old, f["hunks"]), f"patch does not apply to {p}"
+        new = selector.apply_hunks(old, f["hunks"])
+        with open(p, "w") as fh:
+            fh.write(new)
     for tid in SLOW:
         if tid not in tests:
             continue
-        r = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:timeout", tid], cwd=root,
-                           env=dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=root),
-                           capture_output=True, text=True)
-        passed = r.returncode == 0
+        for attempt in range(3):  # a crash under memory pressure is not a failure: try again
+            r = subprocess.run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "no:timeout", tid], cwd=root,
+                               env=dict(os.environ, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=root),
+                               capture_output=True, text=True)
+            passed = r.returncode == 0
+            if passed or r.returncode == 1 and " failed" in r.stdout:
+                break
+        if not passed:
+            print("  rc", r.returncode, (r.stdout + r.stderr).strip().splitlines()[-3:], flush=True)
         a = json.load(open(ap))
         fl = set(a["commits"][cid]["failing"])
         n = tests[tid]
