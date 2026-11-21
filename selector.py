@@ -209,6 +209,18 @@ def parse_patch(text: str):
     return files
 
 
+def hunks_match(old_text: str, hunks) -> bool:
+    """Every hunk's old lines are really at its place in the file, and nothing is left half-read."""
+    old = old_text.split("\n")
+    for h in hunks:
+        if h["oleft"] or h["nleft"]:
+            return False
+        start = h["start"] - 1 if h["olen"] else h["start"]
+        if old[start : start + len(h["old"])] != h["old"]:
+            return False
+    return True
+
+
 def apply_hunks(old_text: str, hunks) -> str:
     old = old_text.split("\n")
     out, pos = [], 0
@@ -544,7 +556,13 @@ class Selector:
     def select(self, patch_text: str):
         tests: set = set()
         notes = []
-        for f in parse_patch(patch_text):
+        try:
+            files = parse_patch(patch_text)
+        except Exception as e:  # noqa: BLE001  a patch we cannot read: run everything
+            return set(self.all), [f"unreadable patch {type(e).__name__}"]
+        if not files and patch_text.strip():
+            return set(self.all), ["no file headers found"]
+        for f in files:
             try:
                 got, why = self.select_file(f)
             except Exception as e:  # never crash: be safe instead
@@ -579,18 +597,21 @@ class Selector:
                 return self.shadow(new_path), "new file"
             return set(), "new file"
         if not (REPO / old_path).exists():
+            if old_path.startswith(("sqlglot/", "tests/")) or self.m.file_tests(old_path) or self.m.open_tests(old_path):
+                return set(self.all), "unknown file in sqlglot or tests"  # e.g. a path we misread
             return set(), "unknown file"
         if new_path is None:
             return self.gone(old_path), "deleted"
         if f.get("binary"):
             return self.gone(old_path), "binary"
-        if old_path.endswith(".py"):
+        if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
             return self.python(old_path, f["hunks"])
         if old_path.startswith(("tests/", "sqlglot/")):
             return self.m.open_tests(old_path) or self.data_fallback(
                 old_path
             ), "data file"
-        return set(), "outside sqlglot and tests"
+        # outside sqlglot and tests: only tests that ran or opened the file can notice
+        return self.m.file_tests(old_path) | self.m.open_tests(old_path), "outside sqlglot and tests"
 
     def shadow(self, path):
         stem = path[:-3]
@@ -621,6 +642,12 @@ class Selector:
 
     def python(self, path, hunks):
         old_text = (REPO / path).read_text(encoding="utf-8")
+        if not hunks_match(old_text, hunks):
+            for h in hunks:  # CRLF patches: try again without the carriage returns
+                for k in ("old", "new"):
+                    h[k] = [s[:-1] if s.endswith("\r") else s for s in h[k]]
+            if not hunks_match(old_text, hunks):
+                return self.m.file_tests(path) or set(self.all), "patch does not match the file"
         new_text = apply_hunks(old_text, hunks)
         old_tree = ast.parse(old_text)
         try:
@@ -808,6 +835,8 @@ class Checker:
             if not p.exists():
                 return None
             old = p.read_text(encoding="utf-8")
+            if not hunks_match(old, f["hunks"]):
+                return None  # we may have misread the patch: never run tests against a guess
             out[path] = (old, apply_hunks(old, f["hunks"]))
         return out
 
@@ -883,8 +912,28 @@ class Checker:
             stdout=subprocess.PIPE,
             bufsize=0,
             env=dict(os.environ, PYTHONPATH=""),
+            start_new_session=True,  # its own process group: a kill also stops the test child it forked
         )
         return self.proc
+
+    def kill(self):
+        """Stop the checking process and any test child it forked."""
+        import signal
+
+        p = self.proc
+        if p is None:
+            return
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            p.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
 
     def ask(self, proc, req, timeout):
         """One request; None if the server dies or takes too long (then it is stopped)."""
@@ -898,8 +947,7 @@ class Checker:
         while not buf.endswith(b"\n"):
             left = end - time.monotonic()
             if left <= 0 or not select.select([proc.stdout], [], [], left)[0]:
-                proc.kill()
-                proc.wait()
+                self.kill()
                 return None
             chunk = os.read(proc.stdout.fileno(), 1 << 20)
             if not chunk:
@@ -913,7 +961,8 @@ class Checker:
             try:
                 self.proc.wait(timeout=10)
             except Exception:  # noqa: BLE001
-                self.proc.kill()
+                pass
+        self.kill()  # and any test child still running
 
     def check(self, files, numbers, cand):
         d = self.durations
@@ -964,20 +1013,102 @@ class Checker:
 
 import time as _time
 
+STARTED_AT = _time.monotonic()
+
 # the whole run has 3 minutes (4.5 in the final): stop checking well before that
 DEADLINE = _time.monotonic() + float(os.environ.get("BR_CHECK_SECONDS", "100"))
 GAIN_SHARE = float(os.environ.get("BR_GAIN_SHARE", "1.0"))  # check when run cost <= this share of the best-case gain
 SETUP_MS = 700
 
 
+class Run:
+    """What gets printed. Every commit always has a safe answer: all tests until the selector has a better one."""
+
+    def __init__(self):
+        import threading
+
+        self.lock = threading.Lock()
+        self.done = False
+        self.ids: list = []
+        self.all: list = []
+        self.answers: dict = {}
+        self.durations: dict = {}
+        self.checker = None
+
+    def emit(self, why=""):
+        with self.lock:
+            if self.done:
+                return
+            self.done = True
+            out = []
+            for cid in self.ids:
+                numbers = self.answers.get(cid)
+                if numbers is None:
+                    numbers = self.all
+                    log(cid, "fallback: all tests", why)
+                try:
+                    workers = pack(numbers, self.durations)
+                except Exception:  # noqa: BLE001
+                    workers = [sorted(numbers)]
+                out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+            sys.stdout.write("".join(line + "\n" for line in out))
+            sys.stdout.flush()
+
+
+def hard_seconds(n_commits):
+    """Print whatever we have by then: the scorer allows ~6 s a commit (3 min for 30, 4.5 for 45)."""
+    return float(os.environ.get("BR_HARD_SECONDS", min(150.0, 40 + 2.4 * n_commits)))
+
+
+def watchdog(run, seconds):
+    import threading
+
+    def fire():
+        run.emit("(time limit)")
+        c = run.checker
+        if c is not None:
+            c.kill()
+        os._exit(0)
+
+    t = threading.Timer(max(1.0, seconds - (_time.monotonic() - STARTED_AT)), fire)
+    t.daemon = True
+    t.start()
+
+
 def main():
-    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    global DEADLINE
+    run = Run()
+    try:
+        tests = json.loads((DATA / "tests.json").read_text())["tests"]
+        run.all = [t["number"] for t in tests]
+        run.durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        run.ids = sorted(p.stem for p in (DATA / "commits").glob("*.patch"))
+        hard = hard_seconds(len(run.ids))
+        DEADLINE = min(DEADLINE, STARTED_AT + hard - 20)
+        watchdog(run, hard)
+        _main(run, tests)
+    except BaseException as e:  # noqa: BLE001  never leave a commit without an answer
+        import traceback
+
+        log("selector error, safe answers for the rest:", type(e).__name__, e)
+        log("".join(traceback.format_exc())[-2000:])
+    finally:
+        if run.checker is not None:
+            try:
+                run.checker.close()
+            except Exception:  # noqa: BLE001
+                run.checker.kill()
+        run.emit("(error)")
+
+
+def _main(run, tests):
     m = Map(MAP)
     index = {tid: i for i, tid in enumerate(m.ids)}
     number_of = {index[t["id"]]: t["number"] for t in tests if t["id"] in index}
     unmapped = {t["number"] for t in tests if t["id"] not in index}
     durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     checker = Checker({t["number"]: t["id"] for t in tests}, durations) if VERIFY else None
+    run.checker = checker
     sel = Selector(m)
     rows = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
@@ -997,6 +1128,7 @@ def main():
             if plan is None:
                 notes.append("check: no")
         rows.append([patch.stem, numbers, notes, plan])
+        run.answers[patch.stem] = set(numbers)  # safe answer now; the check may shrink it later
     todo = [r for r in rows if r[3] is not None]
     # loading sqlglot and heavy test modules is paid once: only if the batch earns it back
     heavy = set().union(*(r[3][3] for r in todo)) if todo else set()
@@ -1012,15 +1144,8 @@ def main():
             except Exception as e:  # noqa: BLE001
                 why = f"check error {type(e).__name__}"
             r[2].append("check: " + why)
-    if checker is not None:
-        checker.close()
+            run.answers[r[0]] = set(r[1])
     for cid, numbers, notes, _ in rows:
-        print(
-            json.dumps(
-                {"commit": cid, "workers": pack(numbers, durations)},
-                separators=(",", ":"),
-            ),
-        )
         log(cid, len(numbers), "|", "; ".join(notes))
 
 

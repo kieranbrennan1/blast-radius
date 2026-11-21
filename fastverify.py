@@ -346,6 +346,13 @@ class Verifier:
         if pid == 0:
             os.close(r)
             try:
+                try:  # a runaway child can never eat the run's CPU: the kernel stops it
+                    import resource
+
+                    cap = int(30 + sum(limits.get(t, 10.0) for t in test_ids))
+                    resource.setrlimit(resource.RLIMIT_CPU, (cap, cap + 5))
+                except Exception:  # noqa: BLE001
+                    pass
                 stop_watch()
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, 1)
@@ -373,11 +380,13 @@ class Verifier:
         os.waitpid(pid, 0)
         text = b"".join(chunks).decode(errors="replace")
         res = {}
+        wanted = set(test_ids)
         for ln in text.splitlines():
             if ln == "#done" or not ln:
                 continue
-            flag, tid = ln.split(" ", 1)
-            res[tid] = flag == "1"
+            flag, _, tid = ln.partition(" ")
+            if tid in wanted and flag in ("0", "1"):
+                res[tid] = flag == "1" and res.get(tid, True)  # reported twice: any failure wins
         if not text.endswith("#done\n"):
             # the child died mid-run: the next test counts as failing, the rest stay unverified
             for tid in test_ids:
@@ -441,6 +450,12 @@ class _Rec(unittest.TestResult):
         super().addSubTest(test, subtest, err)
         if err is not None:
             self._fail(test, err)
+
+    def addSkip(self, test, reason):
+        # skipped here proves nothing (CI may run it): keep the test
+        super().addSkip(test, reason)
+        if self.cur is not None:
+            self.bad = True
 
     def addUnexpectedSuccess(self, test):
         super().addUnexpectedSuccess(test)
