@@ -44,6 +44,24 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
 2. Where the 43 s gap to 153.7 sits on practice: over-selection, CPU, or both.
 3. What "new kinds of change" the final adds, and whether every rule falls back safely on them.
 
+## CPU measured (2026-11-20 22:30, native arm64 image `br-arm`, duckdb works; Mac load ~100, so lowest of 2–5 runs)
+| Set | Version | Simulated | CPU | Total |
+|---|---|---|---|---|
+| Sample 30 | as submitted (check incl. optimizer/executor) | 106.1 | 5.2 | 111.3 |
+| Sample 30 | heavy tests not checked (`BR_SKIP_HEAVY=1`) | 106.4 | 3.0 | **109.4** |
+| Sample 30 | no check (`BR_VERIFY=0`) | 115.4 | 1.0 | 116.4 |
+| 102 fakes | as submitted | 4801.5 | 73.5 | 4875.1 |
+| 102 fakes | heavy not checked | 4829.9 | 12.6 | **4842.5** |
+| 102 fakes | no check | 4849.8 | 2.5 | 4852.3 |
+- Checking optimizer/executor tests costs ~2× what it saves (fakes: −28 s simulated for +61 s CPU). Turn it off.
+- Checks pay only when everything passes (+1.5–2 s each: the worker fee). When a test fails the CPU is wasted
+  (fakes: 19 such checks, 8.8 s CPU for 0.5 s saved; sample 535z 2.2 s CPU for 0.26 s).
+- The run-cost estimate is 2–10× too low (2qn5 est 0.46 s → 1.0 s real).
+- CPU swings 3–6× with Mac load: measure only when the other sessions are idle.
+- **Real misses found** (rechecked with no time limit): m03000, m03009, m03012 — removing `@property` (and a changed
+  default) breaks test_execute_tpcds / test_max_nodes, but the map links those two tests to only ~900 / 18 lines, none
+  of them the changed ones. Their traces are incomplete. ("bigtests" copy is re-tracing tpcds now.)
+
 ## Slices
 1. [x] Docker (Colima) + env, starter runs (1210 s)
 2. [x] Coverage map v2 (follows pool workers), reads map
