@@ -3,3 +3,4 @@ output.jsonl
 __pycache__/
 .venv/
 handoff.md
+work_bt/
