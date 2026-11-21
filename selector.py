@@ -695,6 +695,67 @@ def entry_classes(stmt, spots):
     return found
 
 
+def bound_names(tree):
+    """Every name bound anywhere in a module (with repeats): stores, defs, classes, imports, args."""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load):
+            yield n.id
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield n.name
+        elif isinstance(n, ast.alias):
+            yield n.asname or n.name.split(".")[0]
+        elif isinstance(n, ast.arg):
+            yield n.arg
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            yield n.name
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            yield from n.names
+        elif isinstance(n, ast.MatchAs) and n.name:
+            yield n.name
+        elif isinstance(n, ast.MatchStar) and n.name:
+            yield n.name
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            yield n.rest
+
+
+def import_time_loads(tree, name):
+    """(load node, dotted name of the innermost enclosing class or "") for each load of `name` as a
+    bare name or an attribute that runs while the module or a class body runs: function bodies and
+    lambda bodies are skipped, their decorators and defaults are not."""
+    out = []
+
+    def visit(node, cls):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in node.decorator_list + node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                visit(d, cls)
+            if node.returns is not None:
+                visit(node.returns, cls)
+            for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs + [node.args.vararg, node.args.kwarg]:
+                if a is not None and a.annotation is not None:
+                    visit(a.annotation, cls)
+            return
+        if isinstance(node, ast.Lambda):
+            for d in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+                visit(d, cls)
+            return
+        if isinstance(node, ast.ClassDef):
+            for d in node.decorator_list + node.bases + [k.value for k in node.keywords]:
+                visit(d, cls)
+            inner = f"{cls}.{node.name}" if cls else node.name
+            for s in node.body:
+                visit(s, inner)
+            return
+        if isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load):
+            out.append((node, cls))
+        elif isinstance(node, ast.Attribute) and node.attr == name and isinstance(node.ctx, ast.Load):
+            out.append((node, cls))
+        for child in ast.iter_child_nodes(node):
+            visit(child, cls)
+
+    visit(tree, "")
+    return out
+
+
 def module_name(path: str) -> str:
     mod = path[:-3].replace("/", ".")
     return mod[: -len(".__init__")] if mod.endswith(".__init__") else mod
@@ -719,6 +780,7 @@ class Selector:
             return set(self.all), [f"unreadable patch {type(e).__name__}"]
         if not files and patch_text.strip():
             return set(self.all), ["no file headers found"]
+        self._py_paths = {p for f in files for p in (f.get("old"), f.get("new")) if p and p.endswith(".py")}
         for f in files:
             try:
                 got, why = self.select_file(f)
@@ -950,7 +1012,14 @@ class Selector:
         if c.new is None and names and self.plain_class_constant(path, c, node, names):
             # a deleted class constant now resolves to the base class's value (or raises): the same as
             # changing its value, so only its run-time readers among the class's users can see it
-            return self.scope_tests(path, c.ctx, names), "class constant deleted"
+            if not any(n in m.import_reads for n in names):
+                return self.scope_tests(path, c.ctx, names), "class constant deleted"
+            # read while modules or class bodies run, but only as other classes' attributes
+            # (import_reads_elsewhere): only run-time reads can see the edited class lose it
+            readers = set()
+            for n in names:
+                readers |= m._get(m.names_rt, n) or set()
+            return readers & self.class_tests(path, c.ctx), "class constant deleted (import reads elsewhere)"
         if c.new is None and names:
             # deleted: anything that reads the name may now crash, even at import
             readers = set()
@@ -971,7 +1040,9 @@ class Selector:
         if any(isinstance(x, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom)) for x in ast.walk(node.value)):
             return False
         for n in names:
-            if not n.isupper() or n.startswith("_") or n.endswith("_sql") or n in m.import_reads:
+            if not n.isupper() or n.startswith("_") or n.endswith("_sql"):
+                return False
+            if n in m.import_reads and not self.import_reads_elsewhere(path, c, n):
                 return False
         texts, bases = self._class_index()
         for n in names:
@@ -996,6 +1067,119 @@ class Selector:
                 return False
             todo.extend(bases[b])
         return True
+
+    def import_reads_elsewhere(self, path, c, name):
+        """True when every load of `name` made while a sqlglot or test module or class body runs provably
+        reads something other than the edited class (or a subclass): a bare name in another class's body
+        or at module level (class scopes do not nest or inherit), or `K.name` / `mod.K.name` where K is a
+        top-level class, found by its import, that is neither the edited class nor below it. Anything
+        else (an alias, `cls.name`, a call result, a relative import, a name bound twice) says no.
+        Only for a patch whose one Python file is this one, so every other file is as at eb11aec."""
+        if getattr(self, "_py_paths", None) != {path}:
+            return False
+        qual = ".".join(nm for kind, nm in c.ctx if kind == "class")
+        me = (module_name(path), qual)
+        texts, bases = self._class_index()
+        low, todo = set(), [qual.split(".")[-1]]
+        while todo:  # every class name below the edited one (by bare name: over-counts, the safe side)
+            b = todo.pop()
+            if b in low:
+                continue
+            low.add(b)
+            todo.extend(k for k, bs in bases.items() if any(x.split("[")[0].split(".")[-1].strip() == b for x in bs))
+        if getattr(self, "_top_classes", None) is None:
+            self._top_classes = {}
+
+        def top_classes(mod):
+            if mod not in self._top_classes:
+                got = None
+                f = REPO / (mod.replace(".", "/") + ".py")
+                if not f.exists():
+                    f = REPO / mod.replace(".", "/") / "__init__.py"
+                if f.exists():
+                    try:
+                        t = ast.parse(f.read_text(encoding="utf-8"))
+                        cnt = {}
+                        for b in bound_names(t):
+                            cnt[b] = cnt.get(b, 0) + 1
+                        got = {s.name for s in t.body if isinstance(s, ast.ClassDef) and cnt.get(s.name) == 1}
+                    except (OSError, SyntaxError, ValueError):
+                        got = None
+                self._top_classes[mod] = got
+            return self._top_classes[mod]
+
+        def ok_class(mod, k):
+            tops = top_classes(mod)
+            if not mod.startswith("sqlglot"):
+                return False  # tests' classes are not in the subclass index
+            return tops is not None and k in tops and (mod, k) != me and k not in low
+
+        for top in ("sqlglot", "tests"):
+            for p in sorted((REPO / top).rglob("*.py")):
+                rel = p.relative_to(REPO).as_posix()
+                try:
+                    text = p.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    return False
+                if name not in text:
+                    continue
+                try:
+                    tree = self._new_tree if rel == path else ast.parse(text)
+                except (SyntaxError, ValueError):
+                    return False
+                loads = import_time_loads(tree, name)
+                if any(isinstance(ld, ast.Attribute) for ld, _ in loads):
+                    cnt, mods, classes = self._file_info(rel, tree)
+                for load, inside in loads:
+                    if isinstance(load, ast.Name):
+                        if rel == path and inside == qual:
+                            return False  # the edited class's own body reads it
+                        continue
+                    v = load.value
+                    if isinstance(v, ast.Name) and cnt.get(v.id) == 1 and v.id in classes:
+                        mod, k = classes[v.id]
+                    elif (
+                        isinstance(v, ast.Attribute)
+                        and isinstance(v.value, ast.Name)
+                        and cnt.get(v.value.id) == 1
+                        and v.value.id in mods
+                    ):
+                        mod, k = mods[v.value.id], v.attr
+                    else:
+                        return False
+                    if not ok_class(mod, k):
+                        return False
+        return True
+
+    def _file_info(self, rel, tree):
+        """For one module: {bound name: times bound}, {local name: imported sqlglot module},
+        {local name: (module, class name)} for top-level classes and names imported from modules."""
+        cache = self.__dict__.setdefault("_file_infos", {})
+        if rel in cache and tree is not self._new_tree:
+            return cache[rel]
+        cnt, mods, classes = {}, {}, {}
+        for b in bound_names(tree):
+            cnt[b] = cnt.get(b, 0) + 1
+        this = module_name(rel)
+        for st in tree.body:
+            if isinstance(st, ast.ClassDef):
+                classes[st.name] = (this, st.name)
+        for st in ast.walk(tree):
+            if isinstance(st, ast.ImportFrom) and st.level == 0 and st.module:
+                for a in st.names:
+                    local = a.asname or a.name
+                    sub = f"{st.module}.{a.name}"
+                    if (REPO / (sub.replace(".", "/") + ".py")).exists() or (REPO / sub.replace(".", "/") / "__init__.py").exists():
+                        mods[local] = sub
+                    else:
+                        classes[local] = (st.module, a.name)
+            elif isinstance(st, ast.Import):
+                for a in st.names:
+                    if a.asname:
+                        mods[a.asname] = a.name
+        if tree is not self._new_tree:
+            cache[rel] = (cnt, mods, classes)
+        return cnt, mods, classes
 
     def _class_index(self):
         """All sqlglot and test source text (for string mentions) and {class name: base names} from sqlglot."""
