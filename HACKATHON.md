@@ -116,7 +116,10 @@ Kaggle, AtCoder Heuristic, 1BRC, the Netflix Prize, ARC Prize and the test-selec
 robust entry on the hidden set, not the one tuned to the practice board. What that means here:
 - **The final is the 1BRC re-run.** 1BRC's organiser re-ran the top 40 on wider data (10K keys, not 413); entries
   tuned to the 413 fell out of the top 10 (the official winner among them), and the only entry top 3 everywhere won. Our "kinds of change not in
-  practice" is that wider data: judge every change on the 102 fakes (all kinds), not on the sample or the board.
+  practice" is that wider data: judge every change on the 102 fakes (all kinds), not on the sample alone.
+  **But the fakes don't track the board yet:** 28beab2 looked ~64 s better on them (911.3 vs 975.0) and scored 201.1 vs
+  197.0 on the hidden practice set (tests +23 s, CPU -19 s). Before trusting the fakes again, make them look more like
+  the hidden commits, and split every predicted gain into test seconds and CPU.
 - **Ties within 1 s go to the earliest submission** (the Netflix Prize was decided by a submission 20 minutes earlier).
   The best practice score is entered in the final automatically, so: submit the robust version as early as it is
   validated, and only resubmit later if it is better by more than the noise. Holding a validated version costs
