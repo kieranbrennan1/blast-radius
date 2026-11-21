@@ -208,6 +208,7 @@ class Lines:
     old_changed: set = set()
     new_changed: set = set()
     o2n: dict = {}
+    n2o: dict = {}
 
     @classmethod
     def load(cls, hunks, old_count):
@@ -229,23 +230,27 @@ class Lines:
                     o += 1
                 else:
                     cls.new_changed.add(n)
-                    cls.old_changed.update((o - 1, o))  # an insertion touches its neighbours
                     n += 1
         while o <= old_count + 1:
             cls.o2n[o] = n
             o += 1
             n += 1
+        cls.n2o = {v: k for k, v in cls.o2n.items()}
 
 
 def stmt_key(node, old):
+    """A cheap key equal for the old and new copy of an untouched statement; a full dump otherwise."""
     first, last = node_span(node, "all")
     if old:
-        if any(ln in Lines.old_changed for ln in range(first, last + 1)):
-            return dump(node)
-        return ("same", Lines.o2n.get(first), Lines.o2n.get(last))
-    if any(ln in Lines.new_changed for ln in range(first, last + 1)):
-        return dump(node)
-    return ("same", first, last)
+        a, b = Lines.o2n.get(first), Lines.o2n.get(last)
+        clean = a is not None and b is not None and b - a == last - first
+        clean = clean and not any(ln in Lines.old_changed for ln in range(first, last + 1))
+    else:
+        a, b = Lines.n2o.get(first), Lines.n2o.get(last)
+        clean = a is not None and b is not None and b - a == last - first
+        clean = clean and not any(ln in Lines.new_changed for ln in range(first, last + 1))
+        a, b = first, last
+    return ("same", a, b) if clean else dump(node)
 
 
 class Change:

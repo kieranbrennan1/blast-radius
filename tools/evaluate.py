@@ -1,6 +1,6 @@
 """Run the selector locally on the sample and show cost and misses per commit.
 
-usage: python3 tools/evaluate.py [map path]
+usage: python3 tools/evaluate.py [map path] [data dir with commits/, tests.json, answers.json]
 """
 import json
 import os
@@ -10,7 +10,8 @@ import time
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 mp = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here, "work", "map.json.gz")
-env = dict(os.environ, BR_DATA=os.path.join(here, "sample"), BR_REPO=os.path.join(here, "work", "sqlglot"), BR_MAP=mp)
+data = sys.argv[2] if len(sys.argv) > 2 else os.path.join(here, "sample")
+env = dict(os.environ, BR_DATA=data, BR_REPO=os.path.join(here, "work", "sqlglot"), BR_MAP=mp)
 t0 = time.process_time()
 start = time.time()
 p = subprocess.run([sys.executable, os.path.join(here, "selector.py")], env=env, capture_output=True, text=True)
@@ -19,8 +20,8 @@ if p.returncode:
     print(p.stderr)
     sys.exit(1)
 notes = {ln.split(" ", 1)[0]: ln for ln in p.stderr.splitlines()}
-tests = {t["number"]: t for t in json.load(open(os.path.join(here, "sample", "tests.json")))["tests"]}
-ans = json.load(open(os.path.join(here, "sample", "answers.json")))["commits"]
+tests = {t["number"]: t for t in json.load(open(os.path.join(data, "tests.json")))["tests"]}
+ans = json.load(open(os.path.join(data, "answers.json")))["commits"]
 total = misses = 0
 for line in p.stdout.splitlines():
     d = json.loads(line)
