@@ -387,8 +387,14 @@ def singleton_like(node):
     if isinstance(node, ast.Attribute) and node.attr.isupper() and len(node.attr) > 1:
         base = node.value
         name = base.attr if isinstance(base, ast.Attribute) else base.id if isinstance(base, ast.Name) else ""
-        return name[:1].isupper() and not name.isupper()
+        return name[:1].isupper() and not name.isupper() and name not in MIXIN_ENUMS
     return False
+
+
+# Enums that are also str or int compare equal to plain values: `"duckdb" == Dialects.DUCKDB` is True, `is` is False.
+# In the pinned code only Dialects is compared against plain strings; TokenType, NormalizationStrategy,
+# UsingColumnOrder and AliasPrecedence values always come from enum members (Dialect.__init__ converts settings).
+MIXIN_ENUMS = {"Dialects"}
 
 
 def same_compare(o, n):
@@ -1020,7 +1026,7 @@ class Checker:
         req = {
             "files": {p: [o, n] for p, (o, n) in files.items()},
             "ids": ids,
-            "limits": {self.ids[t]: max(10.0, 20 * d[t] / 1000) for t in order},
+            "limits": {self.ids[t]: max(3.0, 8 * d[t] / 1000) for t in order},  # slower = kept, never dropped
             # after a failure, spend at most half of what dropping the rest could still save
             "stop_on_fail": True if late_gain < AFTER_FAIL_MIN_MS else round(late_gain / 2000, 3),
         }
