@@ -1082,8 +1082,11 @@ class TpcdsPrint:
         """(query numbers, est ms) to fingerprint, or None when the proof does not apply."""
         if not self.ok or not changed or changed & self.e:
             return None
-        if not changed <= self.cg:
-            return None  # a changed function the run never started (or runs at import): not provable here
+        # functions the test never starts cannot change its answer (one that ran at import time is refused
+        # by the checker itself); what is left must run only in the compile stages
+        changed = changed & self.cg
+        if not changed:
+            return None
         qs = set()
         if tmap is not None and tmap.ok:
             for name in changed:

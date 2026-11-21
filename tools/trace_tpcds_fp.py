@@ -93,11 +93,11 @@ sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, on_start)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
 
 t0 = time.time()
-T = standins.Tpcds
-for name in TPCDS_SCHEMA:
-    T.table(name)
-tables_all = pickle.loads(pickle.dumps(T._tables))
-sqls = T.sqls()
+import tests.test_executor as te  # noqa: E402
+
+te.TestExecutor.setUpClass()  # the real class set-up (TPC-H and TPC-DS tables, duckdb views, fixtures): stage E
+tables_all = pickle.loads(pickle.dumps(te.TestExecutor.tpcds_tables))  # the pool ships them to workers
+sqls = te.TestExecutor.tpcds_sqls
 print("loaded", round(time.time() - t0, 1), "s", flush=True)
 
 gen, gen_out, bad = {}, {}, []
