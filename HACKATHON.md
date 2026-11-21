@@ -8,7 +8,7 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
 ## Rules that shape strategy
 - Machine-scored, no pitch. AI allowed. Public repo, Dockerfile at top, + commit hash. 1 submission an hour.
 - Build: network, 4 cores, 8 GB, 10 min. Only PyPI / Docker Hub / GitHub releases at a tag / sqlglot @ eb11aec.
-- Run: no network, 2 cores, 4 GB, 3 min (~30 commits); final 4.5 min (~45 commits). Read-only disk, 64 MB /tmp,
+- Run: no network, 2 cores, 4 GB, 3 min (~40 practice commits; the sample has 30); final 4.5 min (~60 commits). Read-only disk, 64 MB /tmp,
   user nobody, ≤ 256 processes, stdout ≤ 2 MB. Repo ≤ 20 MB.
 - No lookup table from a patch or kind of edit to failing tests. Maps from the pinned commit are fine. Top entries are read.
 - **Final**: our chosen commit (best practice score unless we pick another) runs on unseen commits, *including kinds of
@@ -58,9 +58,12 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
   (fakes: 19 such checks, 8.8 s CPU for 0.5 s saved; sample 535z 2.2 s CPU for 0.26 s).
 - The run-cost estimate is 2–10× too low (2qn5 est 0.46 s → 1.0 s real).
 - CPU swings 3–6× with Mac load: measure only when the other sessions are idle.
-- **Real misses found** (rechecked with no time limit): m03000, m03009, m03012 — removing `@property` (and a changed
-  default) breaks test_execute_tpcds / test_max_nodes, but the map links those two tests to only ~900 / 18 lines, none
-  of them the changed ones. Their traces are incomplete. ("bigtests" copy is re-tracing tpcds now.)
+- ~~Real misses on m03000, m03009, m03012~~ **False alarm.** Run directly, test_execute_tpcds and test_max_nodes pass
+  on m03000, m03009, m03012 and m01061. The recheck tool emptied the test file before running it (pytest exit 4, "no
+  collectors"; fixed in 7a53ac2), so its FAILs were fake. Labels corrected in work/mut1, mut3, eval_new. The tpcds /
+  max_nodes labels in work/mut3 keep changing while the Mac is overloaded: trust only a direct rerun.
+- ad92489: optimizer/executor tests are kept without checking by default. Sample 109.1–110.6 total (was 111.3);
+  fakes 943.0 (was 975.0, no check 952.3).
 
 ## Slices
 1. [x] Docker (Colima) + env, starter runs (1210 s)
@@ -80,3 +83,27 @@ CPU seconds our container burns. Middle of 3 runs. Lower wins. Only the final co
 ## Rules from Kieran
 - Ask before creating the team, making the repo public or submitting (2026-11-20). Later: "Yes, resubmit freely"
   for versions that test better; pushing still asked each time.
+
+## What the problem really is (research 2026-11-20, brain: insights/blast-radius-problem-deep-dive)
+Read before any new build step. Full notes: ~/brain/raw/sources/2026-11-20-blast-radius-problem-notes/.
+- The commits are one-line fake bugs (mutants) from a generator: the job is "which tests kill this mutant".
+  The final is ~60 unseen commits (1.5× the 40 practice) with mutation kinds not seen in practice.
+  Likely new kinds (from the top team's own harness): deleted/reordered statements, changed defaults, removed dict
+  entries, renamed module functions, syntax errors, decorator removal, package __init__ edits, edits to test files
+  and tests/helpers.py, new method overrides. Every one must fall to the safe side.
+- The miss rule = a strict per-commit safe rate (stricter than Meta's "change recall"): one missed failing test = 300 s (≈8 full runs of 36.8 s).
+  Extra passing tests only cost seconds, and a test that fits in a non-busiest worker's spare time costs 0:
+  use that slack for uncertain tests (free insurance). Exclude a test only when 300·p(fail) < what it adds
+  to the busiest worker. Verify at run time only when CPU + p·Δ < min(Δ, 300·p).
+- Workers: run LPT for every m = 1..8 and keep the cheapest (a worker pays only when S > 2m(m+1)).
+- RWX's own stance (Dan Manges): caching "never produces a false positive"; skipping a test ≈ deleting it.
+  So: no risk-taking drops (JstD-style), explainable rules, README showing every map comes from eb11aec.
+- The gap to first (197.0 vs 153.7) is mostly test time on the hidden commits, not CPU: our simulated 176.4 s alone
+  is worse than the leader's whole 153.7 s. Rough split (if their CPU ≈ 9 s): ~31 s tests, ~12 s CPU (20.6 s ours).
+  Both come from keeping the big tests (28.8 / 21.5 / 6.7 s) when nothing breaks. Biggest known lever: replay the TPC-H/TPC-DS
+  executor tests from build-time recordings (likely #1 team's brreplay.py, ~10 other entries do partial
+  replay); any query not recorded → run it / send the test to CI.
+- Production systems all keep a "run everything" list for global files plus a full-run safety net; ours is the
+  all-tests fallback on any error. Keep it.
+- Our tracer uses sys.monitoring with DISABLE but traces each test in its own process, so the coverage
+  "shared helper dropped" bug (testmon #277) can't hit us. Never trace several tests in one process.
