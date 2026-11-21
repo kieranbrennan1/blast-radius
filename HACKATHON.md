@@ -114,7 +114,7 @@ Read before any new build step. Full notes: ~/brain/raw/sources/2026-11-20-blast
 Kaggle, AtCoder Heuristic, 1BRC, the Netflix Prize, ARC Prize and the test-selection tool contests all reward the
 robust entry on the hidden set, not the one tuned to the practice board. What that means here:
 - **The final is the 1BRC re-run.** 1BRC's organiser re-ran the top 40 on wider data (10K keys, not 413); entries
-  tuned to the 413 fell out of the top 10, and the only entry top 3 everywhere won. Our "kinds of change not in
+  tuned to the 413 fell out of the top 10 (the official winner among them), and the only entry top 3 everywhere won. Our "kinds of change not in
   practice" is that wider data: judge every change on the 102 fakes (all kinds), not on the sample or the board.
 - **Ties within 1 s go to the earliest submission** (the Netflix Prize was decided by a submission 20 minutes earlier).
   The best practice score is entered in the final automatically, so: submit the robust version as early as it is
@@ -126,14 +126,17 @@ robust entry on the hidden set, not the one tuned to the practice board. What th
   than the practice runs: keep the watchdog margin.
 - **Top 5 are re-run 5 times on an idle machine:** CPU that swings with load is a risk; prefer stable CPU over a
   lower average.
-- **Other teams' tricks (their own README claims, not verified):** (1) "comparison-value witness": record the real
-  values at every comparison during the build; an operator swap that changes no recorded result selects nothing
-  (Warrior-hound 179.5 → 126.7 s, NecritsSoup 178.7 → 128.5 s on the sample). (2) TPC compile-stage fingerprint
-  (Warrior-hound `e1_cutoff.py`): when the changed code only runs while TPC queries are parsed/optimized/planned,
-  re-run just that stage and compare to the pinned output; identical → drop the executor test, else keep it.
+- **Other teams' tricks (checked in their code 2026-11-20):** (1) Operator-swap rules. NecritsSoup: `is`/`==` and
+  `is not`/`!=` swaps count as no change when the recorded operand *types* use plain identity equality (its own
+  claim: 178.7 → 128.5 s on the 30 sample commits, never run in Docker or on the board). That is close to our
+  None/enum rule, applied per observed site. Warrior-hound also covers `<`/`<=`, `in`, `and`/`or`, skipping a file
+  only when no recorded test evaluation would flip; its value recorder is not in the repo and it publishes no score
+  (a researcher's "179.5 → 126.7 s" for it was false). (2) TPC compile-stage fingerprint (Warrior-hound
+  `e1_cutoff.py`): when the changed code only runs while TPC queries are parsed/optimized/planned, re-run just that
+  stage and compare to the pinned output; identical → drop the executor test, else keep it.
 - **Measured for us (static selection, BR_VERIFY=0, 2026-11-20 23:15, HEAD ~7069665):** 102 fakes → 719.8 s, 33 commits
   break nothing and still cost 157.1 s. The biggest: decorator / def-header edits selecting most of the suite
   (m03010 36.8 s, m03020 29.5 s, m01060 27.5 s), then multi-file def-header edits (m03019 12.7, m01056 10.7).
-  Operator swaps are not where our waste is (sample already 106 s vs their ~127 s), so trick (1) is likely worth
-  little to us (guess). Trick (2) targets the 21.5 s tpcds test; worth a measured try by the session that owns
+  Operator swaps are not where our waste is (sample already ~106 s vs NecritsSoup's 128.5 s), so trick (1) is likely
+  worth little to us (guess). Trick (2) targets the 21.5 s tpcds test; worth a measured try by the session that owns
   selector.py, if Kieran says go. The 2 static "misses" (m01072, m03002) are the known test_sqlglotc truth quirk.
