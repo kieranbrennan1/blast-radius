@@ -93,12 +93,20 @@ class GeneratorMemory(_Timed):
                 gc.collect()
                 tracemalloc.start()
                 try:
-                    before = tracemalloc.get_traced_memory()[0]
-                    for _ in range(100):
-                        dialect.generator()
-                    gc.collect()
-                    after = tracemalloc.get_traced_memory()[0]
+
+                    def grow():
+                        before = tracemalloc.get_traced_memory()[0]
+                        for _ in range(100):
+                            dialect.generator()
+                        gc.collect()
+                        return tracemalloc.get_traced_memory()[0] - before
+
+                    first = grow()  # clean code measures 0 bytes
+                    if first >= 1024 * 100 / 1000:
+                        # a one-time allocation or a leak: the real test's 1000 calls would grow by about
+                        # this first 100 plus nine more of the next 100 (the steady per-call leak)
+                        first += 9 * grow()
                 finally:
                     tracemalloc.stop()
-                # the real test allows < 1024 bytes over 1000 calls; 100 calls get the same per-call budget
-                self.assertLess(after - before, 1024 * 100 / 1000)  # clean code measures 0 bytes
+                # the real test allows < 1024 bytes over 1000 calls; keep a margin for the estimate
+                self.assertLess(first, 900)
