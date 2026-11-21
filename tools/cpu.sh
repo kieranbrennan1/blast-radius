@@ -6,7 +6,7 @@ docker run --rm --platform linux/amd64 --network none --cpus 2 --memory 4096m --
   blast-radius-entry python -c "
 import resource, subprocess, sys, time
 t = time.time()
-subprocess.run(['python', '-S', '/app/selector.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run(['python', '-S', '/app/run.py'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 r = resource.getrusage(resource.RUSAGE_CHILDREN)
 print(f'selector CPU {r.ru_utime + r.ru_stime:.2f} s, wall {time.time() - t:.2f} s')
 "

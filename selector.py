@@ -17,7 +17,6 @@ Then the chosen tests are packed onto the number of workers (1-8) that costs lea
 
 import ast
 import difflib
-import gzip
 import json
 import os
 import pickle
@@ -47,6 +46,8 @@ class Map:
         if path.suffix == ".pkl":
             d = pickle.loads(path.read_bytes())
         else:
+            import gzip
+
             with gzip.open(path, "rt") as f:
                 d = json.load(f)
         self.ids = d["tests"]
@@ -261,7 +262,12 @@ def stmt_key(node, old):
         clean = a is not None and b is not None and b - a == last - first
         clean = clean and not any(ln in Lines.new_changed for ln in range(first, last + 1))
         a, b = first, last
-    return ("same", a, b) if clean else dump(node)
+    if clean:
+        return ("same", a, b)
+    if any(isinstance(getattr(node, f, None), list) for f in COMPOUND_BODIES):
+        # a touched block: pair it with its twin by kind and name, then look inside
+        return ("block", type(node).__name__, getattr(node, "name", None))
+    return dump(node)
 
 
 class Change:
@@ -290,11 +296,14 @@ def header_dump(node):
 def diff_lists(old, new, ctx, parent, out):
     od = [stmt_key(s, True) for s in old]
     nd = [stmt_key(s, False) for s in new]
-    if od == nd:
+    if od == nd and not any(k[0] == "block" for k in od if isinstance(k, tuple)):
         return
     sm = difflib.SequenceMatcher(None, od, nd, autojunk=False)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
+            for k in range(i2 - i1):
+                if isinstance(od[i1 + k], tuple) and od[i1 + k][0] == "block":
+                    diff_node(old[i1 + k], new[j1 + k], ctx, out)
             continue
         if tag == "replace" and i2 - i1 == j2 - j1:
             for o, n in zip(old[i1:i2], new[j1:j2]):

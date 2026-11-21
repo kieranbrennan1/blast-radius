@@ -21,6 +21,9 @@ PY
 COPY map/map.json.gz /app/map.json.gz
 COPY selector.py tools/pickle_map.py /app/
 RUN python /app/pickle_map.py /app/map.json.gz /app/map.pkl && rm /app/map.json.gz \
-    && chmod -R a+rX /app
+    && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py >/dev/null || true \
+    && chmod -R a+rX /app /usr/local/lib/python3.13
 
-CMD ["python", "-S", "/app/selector.py"]
+# a tiny launcher so selector.py itself runs from its compiled .pyc
+RUN printf 'import sys\nsys.path.insert(0, "/app")\nimport selector\nselector.main()\n' > /app/run.py
+CMD ["python", "-S", "/app/run.py"]
