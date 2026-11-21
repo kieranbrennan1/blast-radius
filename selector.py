@@ -487,6 +487,15 @@ def simple_value(node):
     )
 
 
+def is_overload(node):
+    """A def decorated with typing.overload (as overload, t.overload or typing.overload)."""
+    for d in getattr(node, "decorator_list", ()):
+        name = d.attr if isinstance(d, ast.Attribute) else d.id if isinstance(d, ast.Name) else None
+        if name == "overload":
+            return True
+    return False
+
+
 def import_time_risk(old, new):
     """Decorators and default values run when the module is imported: a new one there can break every importer."""
     olds = {dump(d) for d in old.decorator_list}
@@ -859,6 +868,10 @@ class Selector:
                 ), "def changed"
             if c.new is not None and import_time_risk(node, c.new):
                 return body | m.file_tests(path), "def header runs at import"
+            if c.new is not None and is_overload(node) and is_overload(c.new) and node.name == c.new.name:
+                # a typing.overload stub never runs: the next def of the same name replaces it at import, and
+                # its new defaults/decorators passed import_time_risk above (nothing reads typing's registry)
+                return set(), "overload stub"
             return body, "def header"
         if isinstance(node, ast.ClassDef):
             inner = self.class_tests(path, c.ctx + (("class", node.name),))
@@ -964,6 +977,65 @@ def pack(tests, durations):
     return best
 
 
+def pad_order(m, patch_text, number_of, chosen):
+    """Unselected tests to slip into idle worker time, best first: tests that ran lines within 3 of an
+    edit, then tests that touched an edited file, then the edited module's own test file. Free insurance:
+    padding never raises the busiest worker or adds one, so it costs 0 s and can only catch a miss."""
+    near, touched, own = [], [], []
+    try:
+        for f in parse_patch(patch_text):
+            path = f.get("old") or f.get("new")
+            if not path:
+                continue
+            spots = []
+            for h in f["hunks"]:
+                ln = h["start"]
+                for tag in h["seq"]:
+                    if tag == "-":
+                        spots.append(ln)
+                        ln += 1
+                    elif tag == "+":
+                        spots.append(ln)
+                    else:
+                        ln += 1
+            for s in spots:
+                near.append(m.line_tests(path, max(1, s - 3), s + 3))
+            touched.append(m.file_tests(path))
+            if path.startswith("sqlglot/") and path.endswith(".py"):
+                stem = Path(path).stem
+                own.append({i for i, tid in enumerate(m.ids) if tid.startswith((f"tests/test_{stem}.py::", f"tests/dialects/test_{stem}.py::"))})
+    except Exception:  # noqa: BLE001
+        return []
+    out, seen = [], set(chosen)
+    for group in (near, touched, own):
+        for ids in group:
+            for i in sorted(ids):
+                n = number_of.get(i)
+                if n is not None and n not in seen:
+                    seen.add(n)
+                    out.append(n)
+    return out
+
+
+def pad(workers, durations, extra):
+    """Fill each worker up to the busiest one's load with tests from extra (in order), never past it."""
+    if len(workers) < 2 or not extra:
+        return workers
+    loads = [sum(durations[t] for t in w) for w in workers]
+    top = max(loads)
+    n_top = len(workers[loads.index(top)])
+    for t in extra:
+        d = durations.get(t)
+        if d is None:
+            continue
+        i = min(range(len(workers)), key=lambda k: loads[k])
+        # durations are rounded to ms: allow 0.5 ms of error per test on both workers, plus 1 ms
+        if loads[i] + d + (len(workers[i]) + 1 + n_top) // 2 + 1 <= top:
+            workers[i].append(t)
+            loads[i] += d
+    return workers
+
+
 def pack_cost(tests, durations):
     ws = pack(tests, durations)
     return max(sum(durations[t] for t in w) for w in ws) + WORKER_MS * len(ws) if ws else 0
@@ -972,6 +1044,7 @@ def pack_cost(tests, durations):
 # ---------------------------------------------------------------- run-time check
 
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+PAD = os.environ.get("BR_PAD", "1") == "1"  # free insurance in idle worker time
 VERIFY_MAX_MS = 1000  # tests slower than this are kept without running them
 RUN_RATIO = 0.75  # in-process run time / recorded time, measured ~0.6
 # tests that read sqlglot from disk (a subprocess, runpy, source read as text) never see in-memory patches
@@ -1001,6 +1074,44 @@ PROBE_MIN = 3
 # candidates were checked too and all passed. In ~200 labelled commits tpcds never failed alone.
 TPCDS_PROBE = os.environ.get("BR_TPCDS_PROBE", "0") == "1"  # measured: ~14 s saved for ~14 s CPU on 102 fakes, so off
 STANDIN_OFF = os.environ.get("BR_STANDINS", "1") != "1"
+
+
+TPCDS_FP = os.environ.get("BR_TPCDS_FP", "1") == "1"
+TPCDS_FP_ID = "standins_tpcds_fp.py::TpcdsPrint::test_q"
+
+
+class TpcdsPrint:
+    """Which functions run only in TPC-DS's compile stages (tools/trace_tpcds_fp.py): a change confined to
+    them is proven harmless by equal fingerprints (standins_tpcds_fp.py), with no DuckDB and no data."""
+
+    def __init__(self):
+        self.ok = False
+        for p in (MAP.parent / "tpcds_fp.json", Path(__file__).parent / "map" / "tpcds_fp.json"):
+            if p.exists():
+                d = json.loads(p.read_text())
+                self.cg, self.e = set(d["cg"]), set(d["e"]) | set(d.get("both", ()))
+                self.ok = True
+                return
+
+    def plan(self, changed, tmap):
+        """(query numbers, est ms) to fingerprint, or None when the proof does not apply."""
+        if not self.ok or not changed or changed & self.e:
+            return None
+        # functions the test never starts cannot change its answer (one that ran at import time is refused
+        # by the checker itself); what is left must run only in the compile stages
+        changed = changed & self.cg
+        if not changed:
+            return None
+        qs = set()
+        if tmap is not None and tmap.ok:
+            for name in changed:
+                for q in tmap.users.get(name, ()):
+                    qs.add(q["i"])
+        else:
+            return None
+        if not qs:
+            return None
+        return sorted(qs), 300 + 220 * len(qs)  # measured: ~0.13 s optimize + ~0.08 s replay and dumps per query
 
 
 class TpcdsMap:
@@ -1076,6 +1187,7 @@ class Checker:
         self.no_heavy = False
         self.heavy_paid = False
         self.tpcds = None
+        self.tpcds_fp = None
         self.number_of = {v: k for k, v in ids_by_number.items()}
 
     def verifier(self):
@@ -1125,10 +1237,19 @@ class Checker:
             if tid in STANDINS and tid.split("::")[0] not in files:
                 sid, ms = STANDINS[tid]
                 out.append((t, [sid], ms, False))
-            elif tid == TPCDS and pairs and not self.no_heavy and "tests/test_executor.py" not in files:
+            elif tid == TPCDS and pairs and "tests/test_executor.py" not in files:
                 if self.tpcds is None:
                     self.tpcds = TpcdsMap()
                 changed = {f"{p}::{o.co_qualname}" for p, _fn, o, _n, _own in pairs}
+                if TPCDS_FP:
+                    if self.tpcds_fp is None:
+                        self.tpcds_fp = TpcdsPrint()
+                    fp = self.tpcds_fp.plan({f"{p}::{o.co_qualname}" for p, _fn, o, _n, own in pairs if own}, self.tpcds)
+                    if fp:
+                        out.append((t, [f"{TPCDS_FP_ID}{i}" for i in fp[0]], fp[1], False))
+                        continue
+                if self.no_heavy:
+                    continue
                 got = self.tpcds.plan(changed, TPCDS_MAX_MS)
                 if got and (got[2] or TPCDS_PROBE):
                     # exact -> heavy=True; a probe is marked "probe" and needs other candidates beside it
@@ -1354,6 +1475,7 @@ class Run:
         self.ids: list = []
         self.all: list = []
         self.answers: dict = {}
+        self.pads: dict = {}
         self.durations: dict = {}
         self.checker = None
         self.fd = None
@@ -1377,6 +1499,8 @@ class Run:
                     log(cid, "fallback: all tests", why)
                 try:
                     workers = pack(numbers, self.durations)
+                    if PAD and cid in self.pads:
+                        workers = pad(workers, self.durations, self.pads[cid])
                 except Exception:  # noqa: BLE001
                     workers = [sorted(numbers)]
                 out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
@@ -1460,6 +1584,8 @@ def _main(run, tests):
                 notes.append("check: no")
         rows.append([patch.stem, numbers, notes, plan])
         run.answers[patch.stem] = set(numbers)  # safe answer now; the check may shrink it later
+        if PAD and numbers:
+            run.pads[patch.stem] = pad_order(m, text, number_of, numbers)
     todo = [r for r in rows if r[3] is not None]
     # loading sqlglot and heavy test modules is paid once: only if the batch earns it back
     heavy = set().union(*(r[3][3] for r in todo)) if todo else set()
