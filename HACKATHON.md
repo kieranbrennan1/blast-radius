@@ -144,3 +144,12 @@ robust entry on the hidden set, not the one tuned to the practice board. What th
   Operator swaps are not where our waste is (sample already ~106 s vs NecritsSoup's 128.5 s), so trick (1) is likely
   worth little to us (guess). Trick (2) targets the 21.5 s tpcds test; worth a measured try by the session that owns
   selector.py, if Kieran says go. The 2 static "misses" (m01072, m03002) are the known test_sqlglotc truth quirk.
+
+## Rival repos read (2026-11-21 ~01:30, branch `rivals`; brain: insights/blast-radius-rival-repos)
+63 public entries read (no lookup tables found). Built here: TPC-DS plan-fingerprint proof (`standins_tpcds_fp.py`,
+map from `tools/trace_tpcds_fp.py`: 813 compile-only / 230 execution / 147 both functions; replay = real run on 57/57;
+stable over 5 hash seeds; 12.5 s CPU for all 57 queries) and free tests in idle worker time (`pad`, `BR_PAD=0` off).
+Arm64 A/B vs main f35c32a: sample 106.1 = 106.1; 134 fakes 1065.3 = 1065.3, 0 misses; CPU 38.6 vs 38.8 → a tie.
+`BR_GAIN_SHARE=0.5` was worse (+31 s tests, -12.7 s CPU). m01079's tpcds label is a false timeout (real test passes).
+Next lever (not built): import-state fingerprint for module-level / class-header / decorator edits: ~160 s of our
+363 s waste on the fakes (m03020, m01060, m01047, m01058, m03023, m01073 fall back to 700-1,600 tests).
