@@ -35,4 +35,6 @@ for line in p.stdout.splitlines():
     flag = "MISS " + ",".join(tests[t]["id"].split("::")[-1] for t in miss) if miss else ""
     print(f"{d['commit']} {ans[d['commit']]['kind']:8} fail={len(fail):3} chose={len(chosen):5} cost={cost:7.2f} {flag}")
     print("     ", notes.get(d["commit"], "")[5:][:220])
-print(f"TOTAL simulated {total:.1f} s, misses {misses}, selector wall {wall:.2f} s")
+import resource
+ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+print(f"TOTAL simulated {total:.1f} s, misses {misses}, selector wall {wall:.2f} s, cpu {ru.ru_utime + ru.ru_stime:.2f} s")

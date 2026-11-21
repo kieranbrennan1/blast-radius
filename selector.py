@@ -26,6 +26,7 @@ from pathlib import Path
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 REPO = Path(os.environ.get("BR_REPO", "/app/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", "/app/map.pkl"))
+IMPORTS = Path(os.environ.get("BR_IMPORTS", str(MAP.parent / "imports.json")))
 WORKER_MS = 2000
 MAX_WORKERS = 8
 
@@ -757,6 +758,218 @@ def pack(tests, durations):
     return best
 
 
+def pack_cost(tests, durations):
+    ws = pack(tests, durations)
+    return max(sum(durations[t] for t in w) for w in ws) + WORKER_MS * len(ws) if ws else 0
+
+
+# ---------------------------------------------------------------- run-time check
+
+VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+VERIFY_MAX_MS = 1000  # tests slower than this are kept without running them
+RUN_RATIO = 0.75  # in-process run time / recorded time, measured ~0.6
+NEVER_VERIFY = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
+HEAVY_IMPORT_MS = 1900  # duckdb + pandas, needed by the optimizer and executor tests (once)
+HEAVY_MODULES = {"tests.test_optimizer", "tests.test_executor"}
+HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
+SLOW_SETUP = "tests/test_executor.py::TestExecutor::"
+SLOW_SETUP_MS = 2200
+AFTER_FAIL_MIN_MS = float(os.environ.get("BR_AFTER_FAIL_MIN_MS", "1e9"))  # failing tests run slowly: stop at the first  # TestExecutor.setUpClass, paid in every child that runs one
+
+
+class Checker:
+    """Decides, per commit, whether running the cheap candidates beats just selecting them."""
+
+    def __init__(self, ids_by_number, durations):
+        self.ids = ids_by_number
+        self.durations = durations
+        self.v = None
+        self.proc = None
+        self.starts = 0
+        self.no_heavy = False
+        self.heavy_paid = False
+
+    def verifier(self):
+        if self.v is None:
+            import sysconfig
+
+            from fastverify import Verifier
+
+            self.v = Verifier(str(REPO), sysconfig.get_paths()["purelib"], str(IMPORTS))  # static use only
+        return self.v
+
+    def files(self, patch_text):
+        out = {}
+        for f in parse_patch(patch_text):
+            path = f.get("old") or f.get("new")
+            if not f.get("old") or not f.get("new") or f.get("binary") or f["old"] != f["new"]:
+                return None
+            p = REPO / f["old"]
+            if not p.exists():
+                return None
+            old = p.read_text(encoding="utf-8")
+            out[path] = (old, apply_hunks(old, f["hunks"]))
+        return out
+
+    def candidates(self, numbers, limit=None):
+        d = self.durations
+        limit = limit or VERIFY_MAX_MS
+        skip = ("tests/test_optimizer.py", "tests/test_executor.py") if os.environ.get("BR_SKIP_HEAVY") else ("\0",)
+        return [
+            t
+            for t in numbers
+            if d[t] < limit and self.ids.get(t) and self.ids[t] not in NEVER_VERIFY and not self.ids[t].startswith(skip)
+        ]
+
+    def estimate(self, patch_text, numbers):
+        """(gain ms, run cost ms, files, test modules, tests to run, reload size) for checking this commit, or None."""
+        d = self.durations
+        if not self.candidates(numbers, 7000):
+            return None
+        files = self.files(patch_text)
+        if files is None:
+            return None
+        from fastverify import Verifier
+
+        reload_n = 0
+        if Verifier.static_pairs(str(REPO), files) is None:
+            reload = self.verifier().reload_set(files)
+            if reload is None:
+                return None
+            reload_n = len(reload[1])
+        best = None
+        changed = set(files)
+        options = []
+        for limit in (1000, 2600, 7000):
+            base = [t for t in self.candidates(numbers, limit) if self.ids[t].split("::")[0] not in changed]
+            options.append(base)
+            # leave out tests whose class set-up is slow (they are kept, not run)
+            options.append([t for t in base if not self.ids[t].startswith(SLOW_SETUP)])
+        for cand in options:
+            if not cand:
+                continue
+            keep = set(numbers) - set(cand)
+            gain = pack_cost(numbers, d) - pack_cost(keep, d)
+            est = 60 + RUN_RATIO * sum(d[t] for t in cand) + 5 * reload_n
+            if any(self.ids[t].startswith(SLOW_SETUP) for t in cand):
+                est += SLOW_SETUP_MS
+            if not self.heavy_paid and any(self.ids[t].startswith(HEAVY_FILES) for t in cand):
+                est += HEAVY_IMPORT_MS
+            if est > GAIN_SHARE * gain:
+                continue
+            if best is None or gain - est > best[0] - best[1]:
+                mods = {self.ids[t].split("::")[0][:-3].replace("/", ".") for t in cand}
+                best = (gain, est, files, mods, cand, reload_n)
+        if best is None or best[0] < 1000:
+            return None
+        if any(self.ids[t].startswith(HEAVY_FILES) for t in best[4]):
+            self.heavy_paid = True
+        return best
+
+    def server(self):
+        """The checking process (started once, again after a crash, at most twice)."""
+        import subprocess
+        import sysconfig
+
+        if self.proc is not None and self.proc.poll() is None:
+            return self.proc
+        if self.starts >= 3:
+            return None
+        self.starts += 1
+        here = os.path.dirname(os.path.abspath(__file__))
+        self.proc = subprocess.Popen(
+            [sys.executable, "-S", os.path.join(here, "fastverify.py"), str(REPO), sysconfig.get_paths()["purelib"], str(IMPORTS)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            bufsize=0,
+            env=dict(os.environ, PYTHONPATH=""),
+        )
+        return self.proc
+
+    def ask(self, proc, req, timeout):
+        """One request; None if the server dies or takes too long (then it is stopped)."""
+        import select
+        import time
+
+        proc.stdin.write((json.dumps(req) + "\n").encode())
+        proc.stdin.flush()
+        buf = b""
+        end = time.monotonic() + timeout
+        while not buf.endswith(b"\n"):
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([proc.stdout], [], [], left)[0]:
+                proc.kill()
+                proc.wait()
+                return None
+            chunk = os.read(proc.stdout.fileno(), 1 << 20)
+            if not chunk:
+                return None
+            buf += chunk
+        return json.loads(buf)
+
+    def close(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.stdin.close()
+            try:
+                self.proc.wait(timeout=10)
+            except Exception:  # noqa: BLE001
+                self.proc.kill()
+
+    def check(self, files, numbers, cand):
+        d = self.durations
+        heavy = [t for t in cand if self.ids[t].startswith(HEAVY_FILES)]
+        if heavy and self.no_heavy:
+            cand = [t for t in cand if t not in set(heavy)]
+            if not cand:
+                return numbers, "heavy tests unavailable"
+        order = sorted(cand, key=lambda t: (d[t], t))
+        ids = [self.ids[t] for t in order]
+        # after a failure, keep checking only if dropping the rest still pays (e.g. a test edit plus a code edit)
+        est = RUN_RATIO * sum(d[t] for t in order)
+        late_gain = pack_cost(numbers, d) - pack_cost(set(numbers) - set(order), d) - WORKER_MS - max(d[t] for t in order)
+        req = {
+            "files": {p: [o, n] for p, (o, n) in files.items()},
+            "ids": ids,
+            "limits": {self.ids[t]: max(10.0, 20 * d[t] / 1000) for t in order},
+            # after a failure, spend at most half of what dropping the rest could still save
+            "stop_on_fail": True if late_gain < AFTER_FAIL_MIN_MS else round(late_gain / 2000, 3),
+        }
+        proc = self.server()
+        if proc is None:
+            return numbers, "no server"
+        import time
+
+        left = DEADLINE - time.monotonic()
+        if left < 5:
+            return numbers, "out of time"
+        try:
+            ans = self.ask(proc, req, min(left, (15 if heavy else 30) + 3 * est / 1000))
+        except Exception as e:  # noqa: BLE001
+            log("check request failed:", type(e).__name__, e)
+            ans = None
+        if ans is None:
+            if heavy:
+                self.no_heavy = True  # e.g. duckdb cannot load on this CPU: stop using those tests
+            return numbers, "server died or too slow"
+        res = ans.get("res")
+        if res is None:
+            return numbers, ans.get("how", "?")
+        dropped = {t for t in order if res.get(self.ids[t]) is True}
+        failed = sum(1 for t in order if res.get(self.ids[t]) is False)
+        saved = pack_cost(numbers, d) - pack_cost(set(numbers) - dropped, d)
+        return set(numbers) - dropped, (
+            f"{ans['how']}: ran {len(res)}/{len(order)}, {failed} failed, dropped {len(dropped)}, saved {saved} ms for {ans.get('cpu_ms')} ms cpu"
+        )
+
+
+import time as _time
+
+# the whole run has 3 minutes (4.5 in the final): stop checking well before that
+DEADLINE = _time.monotonic() + float(os.environ.get("BR_CHECK_SECONDS", "100"))
+GAIN_SHARE = float(os.environ.get("BR_GAIN_SHARE", "1.0"))  # check when run cost <= this share of the best-case gain
+SETUP_MS = 700
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     m = Map(MAP)
@@ -764,21 +977,51 @@ def main():
     number_of = {index[t["id"]]: t["number"] for t in tests if t["id"] in index}
     unmapped = {t["number"] for t in tests if t["id"] not in index}
     durations = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    checker = Checker({t["number"]: t["id"] for t in tests}, durations) if VERIFY else None
     sel = Selector(m)
+    rows = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        chosen, notes = sel.select(patch.read_text(encoding="utf-8", errors="replace"))
+        text = patch.read_text(encoding="utf-8", errors="replace")
+        chosen, notes = sel.select(text)
         numbers = {number_of[i] for i in chosen if i in number_of}
         if chosen and unmapped:
             numbers |= (
                 unmapped  # tests the map never saw: run them whenever anything runs
             )
+        plan = None
+        if numbers and checker is not None:
+            try:
+                plan = checker.estimate(text, numbers)
+            except Exception as e:  # noqa: BLE001
+                notes.append(f"check: estimate error {type(e).__name__}")
+            if plan is None:
+                notes.append("check: no")
+        rows.append([patch.stem, numbers, notes, plan])
+    todo = [r for r in rows if r[3] is not None]
+    # loading sqlglot and heavy test modules is paid once: only if the batch earns it back
+    heavy = set().union(*(r[3][3] for r in todo)) if todo else set()
+    fixed = SETUP_MS
+    if todo and (os.environ.get("BR_FORCE") or sum(r[3][0] - r[3][1] for r in todo) * GAIN_SHARE > fixed):
+        import time
+
+        for r in todo:
+            t0 = time.process_time() + sum(os.times()[2:4])
+            try:
+                r[1], why = checker.check(r[3][2], r[1], r[3][4])
+                why += f" [{(time.process_time() + sum(os.times()[2:4]) - t0) * 1000:.0f} ms, est {r[3][1]:.0f}, gain {r[3][0]}]"
+            except Exception as e:  # noqa: BLE001
+                why = f"check error {type(e).__name__}"
+            r[2].append("check: " + why)
+    if checker is not None:
+        checker.close()
+    for cid, numbers, notes, _ in rows:
         print(
             json.dumps(
-                {"commit": patch.stem, "workers": pack(numbers, durations)},
+                {"commit": cid, "workers": pack(numbers, durations)},
                 separators=(",", ":"),
-            )
+            ),
         )
-        log(patch.stem, len(numbers), "|", "; ".join(notes))
+        log(cid, len(numbers), "|", "; ".join(notes))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,15 @@ Picks which sqlglot tests a patch can break, for RWX's Blast Radius track at the
    - a changed fixture file selects the tests that opened it; a deleted module or a syntax error selects
      everything that imported it; pytest config changes select everything;
    - anything unexpected falls back to the safe side.
-3. **Packing**: the chosen tests are spread, longest first, over the number of workers (1–8) that costs least.
+3. **Run-time check** (`fastverify.py`): when it pays, the cheap candidate tests are actually run against
+   the patched code and only the ones that fail are kept. A separate process imports sqlglot once and
+   forks a child per commit. If every edit is inside function bodies, the child swaps the new bytecode
+   into the loaded functions (`func.__code__ = new`); otherwise it re-imports the changed modules and every
+   module that imports them (graph from `tools/import_graph.py`, built from the pinned commit). Tests run
+   with `unittest`, process pools run in-process, and a failure, error, timeout or crash keeps the test.
+   It is only used when the expected saving beats the CPU it costs, and a function that already ran
+   while modules were imported is never swapped (its results may be cached).
+4. **Packing**: the chosen tests are spread, longest first, over the number of workers (1–8) that costs least.
 
 No table from patches or kinds of edit to failing tests is used: every decision comes from the map of the
 pinned commit and the patch's own syntax tree.
@@ -41,7 +49,9 @@ python3 tools/build_map.py work/traces sample/tests.json work/sqlglot map/map.js
 
 - [sqlglot](https://github.com/tobymao/sqlglot) (MIT) at commit `eb11aec`, downloaded during the build.
 - The RWX starter kit (`score.py`, `Makefile`, `sample/`, `SCORING.md`, `STARTER_README.md`).
-- Python standard library only at run time. pytest and the packages in `requirements.lock` were used
-  offline to trace the tests.
+- The packages in the organisers' `requirements.lock` (installed in the image so sqlglot's tests can run);
+  pytest was used offline to trace the tests.
+- Idea of running candidate tests at run time with a fork server and `__code__` swaps: seen in other teams'
+  public write-ups for this track; the code here is our own.
 
 Written with help from Claude (Anthropic). Released under the MIT License.

@@ -18,10 +18,17 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
             tar.extract(m, "/app", filter="data")
 PY
 
+# The packages sqlglot's tests need (the organisers' own lock file), so the
+# selector can run cheap candidate tests against the patched code at run time.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir --no-deps -r /app/requirements.lock
+
 COPY map/map.json.gz /app/map.json.gz
-COPY selector.py tools/pickle_map.py /app/
+COPY selector.py fastverify.py tools/pickle_map.py tools/import_graph.py /app/
 RUN python /app/pickle_map.py /app/map.json.gz /app/map.pkl && rm /app/map.json.gz \
-    && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py >/dev/null || true \
+    && python /app/import_graph.py /app/sqlglot /app/imports.json \
+    && python -m compileall -q -j 4 /usr/local/lib/python3.13 /app/selector.py /app/fastverify.py \
+       /app/sqlglot/sqlglot /app/sqlglot/tests >/dev/null || true \
     && chmod -R a+rX /app /usr/local/lib/python3.13
 
 # a tiny launcher so selector.py itself runs from its compiled .pyc
