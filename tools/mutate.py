@@ -244,6 +244,97 @@ def mutate_equiv(rng, repo):
     return None
 
 
+def mutate_default(rng, repo):
+    """Change a default argument value on a one-line `def` (a function header edit)."""
+    files = py_files(repo, "sqlglot")
+    for _ in range(300):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        cands = [i for i, ln in enumerate(lines) if re.match(r"^\s*def \w+\(.*=\s*(True|False|None|\d+)\b.*\).*:$", ln)]
+        if not cands:
+            continue
+        idx = rng.choice(cands)
+        line = lines[idx]
+        h = rng.choice(list(re.finditer(r"=\s*(True|False|None|\d+)\b", line)))
+        v = h.group(1)
+        nv = {"True": "False", "False": "True", "None": "0"}.get(v) or str(int(v) + 1)
+        new_text = "\n".join(lines[:idx] + [line[: h.start(1)] + nv + line[h.end(1) :]] + lines[idx + 1 :])
+        try:
+            compile(new_text, path, "exec")
+        except SyntaxError:
+            continue
+        return path, "\n".join(lines), new_text
+    return None
+
+
+def mutate_decorator(rng, repo):
+    """Remove one decorator line (e.g. @property, @classmethod, @unsupported_args(...))."""
+    files = py_files(repo, "sqlglot")
+    for _ in range(300):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        cands = [i for i, ln in enumerate(lines) if re.match(r"^\s*@[\w.]+(\(.*\))?$", ln) and i + 1 < len(lines) and lines[i + 1].strip().startswith(("def ", "@"))]
+        if not cands:
+            continue
+        idx = rng.choice(cands)
+        new_text = "\n".join(lines[:idx] + lines[idx + 1 :])
+        try:
+            compile(new_text, path, "exec")
+        except SyntaxError:
+            continue
+        return path, "\n".join(lines), new_text
+    return None
+
+
+def mutate_newattr(rng, repo):
+    """Add a class-level setting (borrowed from elsewhere, maybe flipped) to a class that only inherits it."""
+    files = [f for f in py_files(repo, "sqlglot") if any(k in f for k in ("/dialects/", "/generators/", "/parsers/", "/tokenizers/"))]
+    donors = []
+    for f in py_files(repo, "sqlglot"):
+        for ln in open(os.path.join(repo, f), encoding="utf-8").read().split("\n"):
+            if re.match(r"^ {4,8}[A-Z][A-Z_]{3,} = (True|False|\d+)$", ln):
+                donors.append(ln.strip())
+    for _ in range(300):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        heads = [i for i, ln in enumerate(lines) if re.match(r"^ {0,4}class \w+\(.*\):$", ln)]
+        if not heads:
+            continue
+        idx = rng.choice(heads)
+        indent = len(lines[idx]) - len(lines[idx].lstrip()) + 4
+        name, val = rng.choice(donors).split(" = ")
+        flip = {"True": "False", "False": "True"}.get(val) or str(int(val) + 1)
+        new = " " * indent + f"{name} = {rng.choice([val, flip])}"
+        new_text = "\n".join(lines[: idx + 1] + [new] + lines[idx + 1 :])
+        try:
+            compile(new_text, path, "exec")
+        except SyntaxError:
+            continue
+        return path, "\n".join(lines), new_text
+    return None
+
+
+def mutate_base(rng, repo):
+    """Change a class's base to another base used in the same file."""
+    files = py_files(repo, "sqlglot")
+    for _ in range(300):
+        path = rng.choice(files)
+        lines = open(os.path.join(repo, path), encoding="utf-8").read().split("\n")
+        heads = [(i, m) for i, ln in enumerate(lines) if (m := re.match(r"^(\s*class \w+\()([\w.]+)(\):)$", ln))]
+        if len(heads) < 3:
+            continue
+        (idx, m), (_, other) = rng.sample(heads, 2)
+        if other.group(2) == m.group(2):
+            continue
+        new_text = "\n".join(lines[:idx] + [m.group(1) + other.group(2) + m.group(3)] + lines[idx + 1 :])
+        try:
+            compile(new_text, path, "exec")
+        except SyntaxError:
+            continue
+        return path, "\n".join(lines), new_text
+    return None
+
+
 KINDS = {
     "code": (mutate_code, 6),
     "class": (lambda r, repo: mutate_code(r, repo, class_level=True), 3),
@@ -254,6 +345,10 @@ KINDS = {
     "string": (mutate_string, 2),
     "table": (mutate_table, 0),
     "equiv": (mutate_equiv, 0),
+    "default": (mutate_default, 0),
+    "decorator": (mutate_decorator, 0),
+    "newattr": (mutate_newattr, 0),
+    "base": (mutate_base, 0),
 }
 
 

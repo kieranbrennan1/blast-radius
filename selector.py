@@ -552,6 +552,7 @@ class Selector:
     def __init__(self, m: Map):
         self.m = m
         self.all = set(range(len(m.ids)))
+        self._listers = None
 
     def select(self, patch_text: str):
         tests: set = set()
@@ -586,7 +587,7 @@ class Selector:
                 if (REPO / new_path).exists()
                 else (set(), "")
             )
-            return self.gone(old_path) | got, "rename"
+            return self.gone(old_path) | got | self.listers(old_path) | self.listers(new_path), "rename"
         if old_path is None:
             if (
                 new_path
@@ -601,7 +602,7 @@ class Selector:
                 return set(self.all), "unknown file in sqlglot or tests"  # e.g. a path we misread
             return set(), "unknown file"
         if new_path is None:
-            return self.gone(old_path), "deleted"
+            return self.gone(old_path) | self.listers(old_path), "deleted"
         if f.get("binary"):
             return self.gone(old_path), "binary"
         if old_path.endswith(".py") and old_path.startswith(("sqlglot/", "tests/")):
@@ -617,7 +618,30 @@ class Selector:
         stem = path[:-3]
         if stem.endswith("/__init__"):
             stem = stem[: -len("/__init__")]
-        return self.m.file_tests(stem + ".py")
+        return self.m.file_tests(stem + ".py") | self.listers(path)
+
+    def listers(self, path):
+        """Tests that find modules by listing a folder (pkgutil, os.listdir, glob) and ran a file in this one:
+        a file added to or removed from the folder changes what they see."""
+        if self._listers is None:
+            import re
+
+            pat = re.compile(r"iter_modules|walk_packages|listdir|scandir|\.glob\(|\.iterdir\(|os\.walk")
+            files = {tid.split("::")[0] for tid in self.m.ids}
+            hit = set()
+            for tf in files:
+                try:
+                    if pat.search((REPO / tf).read_text(encoding="utf-8", errors="ignore")):
+                        hit.add(tf)
+                except OSError:
+                    pass
+            self._listers = {i for i, tid in enumerate(self.m.ids) if tid.split("::")[0] in hit}
+        folder = os.path.dirname(path) + "/"
+        near = set()
+        for f in self.m.touched:
+            if f.startswith(folder) and "/" not in f[len(folder):]:
+                near |= self.m.file_tests(f)
+        return near & self._listers
 
     def data_fallback(self, path):
         """Data file no test opened from Python (e.g. read by duckdb): tests whose file names it."""
@@ -642,6 +666,10 @@ class Selector:
 
     def python(self, path, hunks):
         old_text = (REPO / path).read_text(encoding="utf-8")
+        for h in hunks:  # an encoding line, BOM or NUL changes how Python reads the file: not a comment edit
+            for ln in h["old"] + h["new"]:
+                if "\ufeff" in ln or "\x00" in ln or "\ufffd" in ln or ("coding" in ln and h["start"] <= 3 and ln.lstrip().startswith("#")):
+                    return self.m.file_tests(path) or set(self.all), "encoding line"
         if not hunks_match(old_text, hunks):
             for h in hunks:  # CRLF patches: try again without the carriage returns
                 for k in ("old", "new"):
@@ -679,6 +707,13 @@ class Selector:
                 return set(), "new line"
             if isinstance(node, (ast.Import, ast.ImportFrom)) or (m.known and identifiers(node) - m.known):
                 return m.file_tests(path), "new top statement may break import"
+            if isinstance(node, ast.ClassDef) or getattr(node, "decorator_list", None):
+                # a new class registers itself at import (metaclass, __init_subclass__, subclass scans such
+                # as the parser's function table) and a decorator runs at import: nobody needs to read its name
+                return m.file_tests(path) | self.listers(path), "new class or decorated def"
+            if c.ctx and c.ctx[-1][0] == "class" and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # a new method is found through dir()/getattr (e.g. the generator's *_sql dispatch), not by name
+                return self.class_tests(path, c.ctx), "new method"
             names = target_names(node)
             return self.scope_tests(path, c.ctx, names or None), "new top statement"
         if c.part == "insert":
@@ -795,7 +830,12 @@ def pack_cost(tests, durations):
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 VERIFY_MAX_MS = 1000  # tests slower than this are kept without running them
 RUN_RATIO = 0.75  # in-process run time / recorded time, measured ~0.6
-NEVER_VERIFY = {"tests/dialects/test_dialect.py::TestDialect::test_lazy_load"}
+# tests that read sqlglot from disk (a subprocess, runpy, source read as text) never see in-memory patches
+NEVER_VERIFY = {
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+    "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata",
+}
+NEVER_VERIFY_FILES = ("tests/test_sqlglotc.py", "tests/leakcheck.py")
 HEAVY_IMPORT_MS = 1900  # duckdb + pandas, needed by the optimizer and executor tests (once)
 HEAVY_MODULES = {"tests.test_optimizer", "tests.test_executor"}
 HEAVY_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
@@ -848,6 +888,7 @@ class Checker:
             t
             for t in numbers
             if d[t] < limit and self.ids.get(t) and self.ids[t] not in NEVER_VERIFY and not self.ids[t].startswith(skip)
+            and not self.ids[t].startswith(NEVER_VERIFY_FILES)
         ]
 
     def estimate(self, patch_text, numbers):
@@ -1034,6 +1075,13 @@ class Run:
         self.answers: dict = {}
         self.durations: dict = {}
         self.checker = None
+        self.fd = None
+        try:  # answers go to a private copy of stdout; anything else printed lands on stderr
+            sys.stdout.flush()
+            self.fd = os.dup(1)
+            os.dup2(2, 1)
+        except OSError:
+            self.fd = None
 
     def emit(self, why=""):
         with self.lock:
@@ -1051,8 +1099,10 @@ class Run:
                 except Exception:  # noqa: BLE001
                     workers = [sorted(numbers)]
                 out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
-            sys.stdout.write("".join(line + "\n" for line in out))
-            sys.stdout.flush()
+            data = "".join(line + "\n" for line in out).encode()
+            fd = self.fd if self.fd is not None else 1
+            while data:
+                data = data[os.write(fd, data) :]
 
 
 def hard_seconds(n_commits):

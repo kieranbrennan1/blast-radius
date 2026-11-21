@@ -353,6 +353,11 @@ class Verifier:
                     resource.setrlimit(resource.RLIMIT_CPU, (cap, cap + 5))
                 except Exception:  # noqa: BLE001
                     pass
+                try:  # if memory runs out, the kernel should kill this child, not the selector
+                    with open("/proc/self/oom_score_adj", "w") as fh:
+                        fh.write("1000")
+                except OSError:
+                    pass
                 stop_watch()
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, 1)
