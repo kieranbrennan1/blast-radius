@@ -102,9 +102,10 @@ Read before any new build step. Full notes: ~/brain/raw/sources/2026-11-20-blast
   is worse than the leader's whole 153.7 s. Rough split (if their CPU ≈ 9 s): ~31 s tests, ~12 s CPU (20.6 s ours).
   On the 30 sample commits we beat the leader's own claim (~106 s vs ~132 s of tests), so we lose on the hidden commits.
   Likely causes (guesses, not measured): the big tests (28.8 max_nodes / 21.5 tpcds / 6.7 s) kept when nothing breaks,
-  and unfamiliar edits falling back to all tests. Biggest known lever: replay the TPC-H/TPC-DS
+  and unfamiliar edits falling back to all tests. Lever tried: replay the TPC-H/TPC-DS
   executor tests from build-time recordings (likely #1 team's brreplay.py, ~10 other entries do partial
-  replay); any query not recorded → run it / send the test to CI.
+  replay); any query not recorded → run it / send the test to CI. Our version (e5078f7) broke even (~14 s saved
+  for ~14 s CPU) and is off by default.
 - Production systems all keep a "run everything" list for global files plus a full-run safety net; ours is the
   all-tests fallback on any error. Keep it.
 - Our tracer uses sys.monitoring with DISABLE but traces each test in its own process, so the coverage
